@@ -9,6 +9,11 @@ videos/
 runs/
 logs/
 queue/
+/downloads/
+/cache/
+/runtime.env
+/config.json
+/doctor.json
 *.mp4
 *.mov
 *.mkv
