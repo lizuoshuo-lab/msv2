@@ -97,6 +97,9 @@ fi
 export MSV2_SOURCE_DIR="${MSV2_SOURCE_DIR:-$MSV2_ROOT/vendor/mini-splatting2}"
 export MSV2_SWINIR_SOURCE="${MSV2_SWINIR_SOURCE:-$MSV2_ROOT/vendor/SwinIR}"
 export MSV2_SWINIR_WEIGHT="${MSV2_SWINIR_WEIGHT:-$MSV2_ROOT/weights/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth}"
+export MSV2_HEAD_DETECTOR_WEIGHT="${MSV2_HEAD_DETECTOR_WEIGHT:-$MSV2_ROOT/weights/face_detection_yunet_2023mar.onnx}"
+export MSV2_HEAD_PARSER_SOURCE="${MSV2_HEAD_PARSER_SOURCE:-$MSV2_ROOT/vendor/head-parser}"
+export MSV2_HEAD_PARSER_WEIGHT="${MSV2_HEAD_PARSER_WEIGHT:-$MSV2_ROOT/weights/face_parsing_resnet18.pt}"
 "$host_python" - "$APP_DIR/upstream.lock.json" "$MSV2_ROOT" <<'PY'
 import hashlib, json, os, shutil, sys, tarfile, tempfile, time, urllib.request
 from pathlib import Path
@@ -177,9 +180,43 @@ def source(key, variable):
     (extracted/'.msv2-source.json').write_text(json.dumps(data,indent=2)+'\n')
     extracted.replace(dest)
     staging.rmdir()
+def file_source(key, variable):
+    entry=lock[key];dest=Path(os.environ[variable]);receipt=dest/'.msv2-source.json'
+    expected={item['path']:item['sha256'] for item in entry['files']}
+    for name in expected:
+        path=Path(name)
+        if path.is_absolute() or '..' in path.parts:raise RuntimeError('Invalid pinned source path: '+name)
+    if dest.exists():
+        if not receipt.is_file():raise RuntimeError('Existing source has no pinned installation receipt: '+str(dest))
+        saved=json.loads(receipt.read_text())
+        if saved.get('commit')!=entry['commit'] or saved.get('files')!=expected:
+            raise RuntimeError('Existing source version differs from the lock: '+str(dest))
+        for name,sha in expected.items():
+            if not (dest/name).is_file() or digest(dest/name)!=sha:
+                raise RuntimeError('Installed source was changed: '+str(dest/name))
+        return
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    staging=Path(tempfile.mkdtemp(prefix=dest.name+'-install-',dir=dest.parent))
+    for item in entry['files']:
+        path=staging/item['path']
+        fetch(item['url'],path,item['sha256'])
+        if path.stat().st_size!=item['bytes']:raise RuntimeError('Pinned source size differs: '+item['path'])
+    data=dict(repository=entry['repository'],commit=entry['commit'],source_kind='pinned_files',files=expected)
+    (staging/'.msv2-source.json').write_text(json.dumps(data,indent=2)+'\n')
+    staging.replace(dest)
 source('mini_splatting2','MSV2_SOURCE_DIR')
 source('swinir','MSV2_SWINIR_SOURCE')
+file_source('head_parser','MSV2_HEAD_PARSER_SOURCE')
 weight=lock['swinir4_weight'];fetch(weight['url'],Path(os.environ['MSV2_SWINIR_WEIGHT']),weight['sha256'])
+parser_weight=lock['head_parser_weight'];parser_path=Path(os.environ['MSV2_HEAD_PARSER_WEIGHT'])
+fetch(parser_weight['url'],parser_path,parser_weight['sha256'])
+if parser_path.stat().st_size!=parser_weight['bytes']:raise RuntimeError('Head parser weight size differs from the lock')
+detector=lock['head_detector']
+detector_weight=Path(os.environ['MSV2_HEAD_DETECTOR_WEIGHT']).resolve()
+fetch(detector['url'],detector_weight,detector['sha256'])
+if detector_weight.stat().st_size!=detector['bytes']:raise RuntimeError('YuNet weight size differs from the lock')
+license=detector['license']
+fetch(license['url'],root/'vendor/head-detector/LICENSE',license['sha256'])
 print('MSV2_PINNED_SOURCES_READY',flush=True)
 PY
 if [[ -n "$existing_python" ]]; then
@@ -236,6 +273,9 @@ runtime_tmp="$MSV2_ROOT/runtime.env.tmp"
   printf 'export MSV2_SOURCE_DIR=%q\n' "$MSV2_SOURCE_DIR"
   printf 'export MSV2_SWINIR_SOURCE=%q\n' "$MSV2_SWINIR_SOURCE"
   printf 'export MSV2_SWINIR_WEIGHT=%q\n' "$MSV2_SWINIR_WEIGHT"
+  printf 'export MSV2_HEAD_DETECTOR_WEIGHT=%q\n' "$MSV2_HEAD_DETECTOR_WEIGHT"
+  printf 'export MSV2_HEAD_PARSER_SOURCE=%q\n' "$MSV2_HEAD_PARSER_SOURCE"
+  printf 'export MSV2_HEAD_PARSER_WEIGHT=%q\n' "$MSV2_HEAD_PARSER_WEIGHT"
   if [[ -n "${MSV2_EXTENSIONS_DIR:-}" ]]; then printf 'export MSV2_EXTENSIONS_DIR=%q\n' "$MSV2_EXTENSIONS_DIR"; fi
   if [[ -n "${CUDA_HOME:-}" ]]; then
     printf 'export CUDA_HOME=%q\n' "$CUDA_HOME"

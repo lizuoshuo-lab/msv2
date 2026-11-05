@@ -20,6 +20,7 @@ DEFAULTS = dict(
     importance_metric="outdoor",
     holdout=8,
     gpu_memory_fraction=0.85,
+    sr_region="full",
     sr_tile=256,
     sr_tile_overlap=32,
     upload_stable_seconds=30,
@@ -67,6 +68,8 @@ def load_config(path=None, overrides=None):
         raise ValueError("scales must be a nonempty subset of [1, 2, 4]")
     if options["importance_metric"] not in ("outdoor", "indoor"):
         raise ValueError("importance_metric must be outdoor or indoor")
+    if options["sr_region"] not in ("head", "full"):
+        raise ValueError("sr_region must be head or full")
     if options["matching"] not in ("sequential", "exhaustive"):
         raise ValueError("matching must be sequential or exhaustive")
     if (

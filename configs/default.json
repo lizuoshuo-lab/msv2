@@ -2,6 +2,7 @@
   "sample_fps": 3,
   "scales": [1, 2, 4],
   "importance_metric": "outdoor",
+  "sr_region": "full",
   "iterations": 18000,
   "seed": 0,
   "holdout": 8

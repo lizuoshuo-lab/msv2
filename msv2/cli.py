@@ -70,6 +70,17 @@ def parser():
     prepare.add_argument("input")
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--config")
+    extract = commands.add_parser(
+        "extract-head",
+        parents=[common],
+        help="extract native head masks and transparent pixels on CPU",
+    )
+    extract.add_argument(
+        "input", help="image directory, dataset or prepared dataset directory"
+    )
+    extract.add_argument(
+        "--output", required=True, help="new directory outside the source"
+    )
     return result
 
 
@@ -98,6 +109,24 @@ def main(argv=None):
         from .doctor import doctor
 
         result = doctor(root, args.cpu)
+    elif args.command == "extract-head":
+        from .head_extract import extract_head
+
+        result = extract_head(
+            args.input,
+            args.output,
+            parser_source=os.environ.get(
+                "MSV2_HEAD_PARSER_SOURCE", str(root / "vendor/head-parser")
+            ),
+            parser_weight=os.environ.get(
+                "MSV2_HEAD_PARSER_WEIGHT",
+                str(root / "weights/face_parsing_resnet18.pt"),
+            ),
+            detector_weight=os.environ.get(
+                "MSV2_HEAD_DETECTOR_WEIGHT",
+                str(root / "weights/face_detection_yunet_2023mar.onnx"),
+            ),
+        )
     else:
         from .data import prepare_colmap, prepare_video
 

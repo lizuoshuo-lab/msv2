@@ -65,7 +65,76 @@ def camera_records(rows):
                 split=r["split"],
             )
         )
+        for field in ("source_frame", "view_type"):
+            if field in r:
+                result[-1][field] = r[field]
+        if r.get("view_type") == "head":
+            bbox = r.get("bbox_native", r.get("native_bbox"))
+            if bbox is not None:
+                result[-1]["native_bbox"] = list(bbox)
     return result
+
+
+def camera_input_mapping(rows, sr_region=None):
+    dimensions = [list(wh) for wh in sorted({tuple(row["wh"]) for row in rows})]
+    data = dict(
+        records=[
+            {
+                key: value
+                for key, value in row.items()
+                if key not in ("image", "native_image")
+            }
+            for row in rows
+        ],
+        mask_used=False,
+        full_frame=True,
+        coordinate_convention="COLMAP .5-based pixel centers",
+        training_resolution=rows[0]["wh"] if len(dimensions) == 1 else None,
+    )
+    if any("view_type" in row for row in rows):
+        groups = {}
+        for row in rows:
+            source = str(row.get("source_frame", row["frame"]))
+            if source in groups and groups[source] != row["split"]:
+                raise ValueError("Full and head views must share the source split")
+            groups[source] = row["split"]
+        heads = sum(row.get("view_type") == "head" for row in rows)
+        head_train = sum(
+            row.get("view_type") == "head" and row["split"] == "train" for row in rows
+        )
+        head_test = heads - head_train
+        data.update(
+            full_frame=heads == 0,
+            view_layout="full1x_head4x"
+            if heads
+            else "full1x_no_head"
+            if sr_region == "head"
+            else "full",
+            source_frames=len(
+                {str(row.get("source_frame", row["frame"])) for row in rows}
+            ),
+            view_count=len(rows),
+            full_views=len(rows) - heads,
+            head_views=heads,
+            training_resolution=None if heads else data["training_resolution"],
+            training_resolutions=dimensions,
+            training_mask_used=False,
+            training_crop_used=head_train > 0,
+            crop_views_present=heads > 0,
+            head_train_views=head_train,
+            head_test_views=head_test,
+            input_composite_mask=sr_region == "head" and heads > 0,
+            input_head_mask_used=sr_region == "head" and heads > 0,
+            input_roi_composite=sr_region == "head" and heads > 0,
+            full_frame_4x_generated=False,
+            source_group_split=True,
+        )
+        if heads:
+            data["native_footprint_approximation"] = (
+                "Unchanged native symmetric-FoV covariance clamp; calibrated crop pixel centers "
+                "do not imply pixel-identical full4-then-crop rendering"
+            )
+    return data
 
 
 def export(engine, scale):
@@ -231,15 +300,8 @@ def export(engine, scale):
     )
     save(
         out / "camera-input-mapping.json",
-        dict(
-            records=[
-                {k: v for k, v in row.items() if k not in ("image", "native_image")}
-                for row in rows
-            ],
-            mask_used=False,
-            full_frame=True,
-            coordinate_convention="COLMAP .5-based pixel centers",
-            training_resolution=rows[0]["wh"],
+        camera_input_mapping(
+            rows, engine.config.get("sr_region", "full") if scale == 4 else None
         ),
     )
     shutil.copy2(run / "ply-parity.json", out / "native-ply-parity.json")

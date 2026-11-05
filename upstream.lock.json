@@ -25,6 +25,55 @@
     "torch": "2.7.1+cu128",
     "torchvision": "0.22.1+cu128",
     "cuda_toolkit": "12.8",
-    "cuda_extensions": ["simple-knn", "diff-gaussian-rasterization", "diff-gaussian-rasterization_ms", "fused-ssim"]
+    "cuda_extensions": [
+      "simple-knn",
+      "diff-gaussian-rasterization",
+      "diff-gaussian-rasterization_ms",
+      "fused-ssim"
+    ]
+  },
+  "head_parser": {
+    "repository": "https://github.com/yakhyo/face-parsing",
+    "commit": "8a4729d95118d0e97c44185f9bdef3d6bfeaaf99",
+    "directory": "head-parser",
+    "files": [
+      {
+        "path": "models/bisenet.py",
+        "url": "https://raw.githubusercontent.com/yakhyo/face-parsing/8a4729d95118d0e97c44185f9bdef3d6bfeaaf99/models/bisenet.py",
+        "sha256": "d73e5e81ebee1e8e9754af559d7d38e5494f5ba475595bad004bea3e4fc7dd12",
+        "bytes": 7568
+      },
+      {
+        "path": "models/resnet.py",
+        "url": "https://raw.githubusercontent.com/yakhyo/face-parsing/8a4729d95118d0e97c44185f9bdef3d6bfeaaf99/models/resnet.py",
+        "sha256": "2001df461431fc8735645345b549bf86bf216dd5c47879cbf9f5077f9b9c740d",
+        "bytes": 7099
+      },
+      {
+        "path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/yakhyo/face-parsing/8a4729d95118d0e97c44185f9bdef3d6bfeaaf99/LICENSE",
+        "sha256": "a4f7998feb5c90555daae4329db61caf7049e6b2706991dc1d9eb2a0923847ae",
+        "bytes": 1080
+      }
+    ]
+  },
+  "head_parser_weight": {
+    "file": "face_parsing_resnet18.pt",
+    "url": "https://github.com/yakhyo/face-parsing/releases/download/weights/resnet18.pt",
+    "sha256": "18c44e06b77e47da86fe2b48fac78e0ccbd0b5241c829f9487ebf7fd4a6389e6",
+    "bytes": 55361505,
+    "upstream_file": "resnet18.pt"
+  },
+  "head_detector": {
+    "repository": "https://github.com/opencv/opencv_zoo",
+    "commit": "48b10fa505aeb51fbd127fc60a5c660040e823b7",
+    "file": "face_detection_yunet_2023mar.onnx",
+    "url": "https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+    "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    "bytes": 232589,
+    "license": {
+      "url": "https://raw.githubusercontent.com/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/LICENSE",
+      "sha256": "c83b8120c50ccbd4c4f96edf53141bdd566ebb8f8e9227e415326aa1b1aba958"
+    }
   }
 }

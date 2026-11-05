@@ -40,6 +40,9 @@ class DeploymentTests(unittest.TestCase):
             "MSV2_SWINIR_SOURCE",
             "MSV2_SWINIR_WEIGHT",
             "MSV2_EXTENSIONS_DIR",
+            "MSV2_HEAD_DETECTOR_WEIGHT",
+            "MSV2_HEAD_PARSER_SOURCE",
+            "MSV2_HEAD_PARSER_WEIGHT",
         ):
             self.environment.pop(key, None)
 
@@ -79,17 +82,38 @@ class DeploymentTests(unittest.TestCase):
         shutil.copy2(PROJECT / "msv2.sh", self.app / "msv2.sh")
         interpreter = self.folder / "chosen interpreter"
         self.script(
-            interpreter, 'printf "%s" "$MSV2_SOURCE_DIR" > "$MSV2_ROOT/chosen-source"\n'
+            interpreter,
+            'printf "%s" "$MSV2_SOURCE_DIR" > "$MSV2_ROOT/chosen-source"\n'
+            'printf "%s" "$MSV2_HEAD_DETECTOR_WEIGHT" > "$MSV2_ROOT/chosen-head"\n'
+            'printf "%s" "$MSV2_HEAD_PARSER_SOURCE" > "$MSV2_ROOT/chosen-parser-source"\n'
+            'printf "%s" "$MSV2_HEAD_PARSER_WEIGHT" > "$MSV2_ROOT/chosen-parser-weight"\n',
         )
         (self.root / "runtime.env").write_text(
             "export MSV2_PYTHON=/nonexistent/old-python\nexport MSV2_SOURCE_DIR=/saved/source\n"
+            "export MSV2_HEAD_DETECTOR_WEIGHT=/saved/detector.onnx\n"
+            "export MSV2_HEAD_PARSER_SOURCE=/saved/parser\n"
+            "export MSV2_HEAD_PARSER_WEIGHT=/saved/parser.pt\n"
         )
         self.environment["MSV2_PYTHON"] = str(interpreter)
         self.environment["MSV2_SOURCE_DIR"] = "/explicit/source with spaces"
+        self.environment["MSV2_HEAD_DETECTOR_WEIGHT"] = "/explicit/head detector.onnx"
+        self.environment["MSV2_HEAD_PARSER_SOURCE"] = "/explicit/head parser source"
+        self.environment["MSV2_HEAD_PARSER_WEIGHT"] = "/explicit/head parser.pt"
         result = self.invoke(self.app / "msv2.sh", "status")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             (self.root / "chosen-source").read_text(), "/explicit/source with spaces"
+        )
+        self.assertEqual(
+            (self.root / "chosen-head").read_text(), "/explicit/head detector.onnx"
+        )
+        self.assertEqual(
+            (self.root / "chosen-parser-source").read_text(),
+            "/explicit/head parser source",
+        )
+        self.assertEqual(
+            (self.root / "chosen-parser-weight").read_text(),
+            "/explicit/head parser.pt",
         )
 
     def bootstrap_fixture(self, tools=True):
@@ -144,6 +168,60 @@ class DeploymentTests(unittest.TestCase):
             url="https://example.invalid/never-requested",
             sha256=hashlib.sha256(weight.read_bytes()).hexdigest(),
         )
+        parser_source = self.root / "vendor/head-parser"
+        parser_files = []
+        for name in ("models/bisenet.py", "models/resnet.py", "LICENSE"):
+            path = parser_source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fixed parser fixture, never imported\n")
+            parser_files.append(
+                dict(
+                    path=name,
+                    url="https://example.invalid/never-requested",
+                    sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                    bytes=path.stat().st_size,
+                )
+            )
+        lock["head_parser"] = dict(
+            repository="https://example.invalid/parser",
+            commit="fixed-parser",
+            directory="head-parser",
+            files=parser_files,
+        )
+        (parser_source / ".msv2-source.json").write_text(
+            json.dumps(
+                dict(
+                    repository=lock["head_parser"]["repository"],
+                    commit=lock["head_parser"]["commit"],
+                    source_kind="pinned_files",
+                    files={item["path"]: item["sha256"] for item in parser_files},
+                )
+            )
+        )
+        parser_weight = self.root / "weights/face_parsing_resnet18.pt"
+        parser_weight.write_bytes(b"head parser fixture, never loaded")
+        lock["head_parser_weight"] = dict(
+            url="https://example.invalid/never-requested",
+            sha256=hashlib.sha256(parser_weight.read_bytes()).hexdigest(),
+            bytes=parser_weight.stat().st_size,
+        )
+        detector = self.root / "weights/face_detection_yunet_2023mar.onnx"
+        detector.write_bytes(b"detector fixture, never loaded")
+        license_file = self.root / "vendor/head-detector/LICENSE"
+        license_file.parent.mkdir()
+        license_file.write_bytes(b"MIT fixture")
+        lock["head_detector"] = dict(
+            repository="https://example.invalid/detector",
+            commit="pinned-detector",
+            file=detector.name,
+            url="https://example.invalid/unused",
+            sha256=hashlib.sha256(detector.read_bytes()).hexdigest(),
+            bytes=detector.stat().st_size,
+            license=dict(
+                url="https://example.invalid/unused",
+                sha256=hashlib.sha256(license_file.read_bytes()).hexdigest(),
+            ),
+        )
         (self.app / "upstream.lock.json").write_text(json.dumps(lock))
         return scripts / "bootstrap.sh"
 
@@ -167,6 +245,18 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(calls, [b"-s", b"-", b"-s", b"-"])
         self.assertFalse((self.root / ".venv").exists())
         self.assertTrue((self.root / "runtime.env").is_file())
+        self.assertEqual(
+            (self.root / "vendor/head-detector/LICENSE").read_bytes(), b"MIT fixture"
+        )
+        self.assertIn(
+            "MSV2_HEAD_DETECTOR_WEIGHT", (self.root / "runtime.env").read_text()
+        )
+        self.assertIn(
+            "MSV2_HEAD_PARSER_SOURCE", (self.root / "runtime.env").read_text()
+        )
+        self.assertIn(
+            "MSV2_HEAD_PARSER_WEIGHT", (self.root / "runtime.env").read_text()
+        )
         (self.root / "vendor/mini-splatting2/source.py").write_text("changed")
         rejected = self.invoke(bootstrap)
         self.assertNotEqual(rejected.returncode, 0)
@@ -174,6 +264,59 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(
             (self.root / "interpreter-calls").read_bytes().split(b"\0")[:-1], calls
         )
+
+    def test_head_detector_size_mismatch_rejects_before_runtime_import(self):
+        bootstrap = self.bootstrap_fixture()
+        lock_file = self.app / "upstream.lock.json"
+        lock = json.loads(lock_file.read_text())
+        lock["head_detector"]["bytes"] += 1
+        lock_file.write_text(json.dumps(lock))
+        rejected = self.invoke(bootstrap)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("YuNet weight size differs", rejected.stderr)
+        self.assertFalse((self.root / "interpreter-calls").exists())
+
+    def test_head_parser_source_install_and_tamper_rejection(self):
+        bootstrap = self.bootstrap_fixture()
+        lock_file = self.app / "upstream.lock.json"
+        lock = json.loads(lock_file.read_text())
+        fixture_source = self.root / "vendor/head-parser"
+        destination = self.folder / "chosen head parser"
+        self.environment["MSV2_HEAD_PARSER_SOURCE"] = str(destination)
+        for item in lock["head_parser"]["files"]:
+            item["url"] = (fixture_source / item["path"]).as_uri()
+        lock_file.write_text(json.dumps(lock))
+        for _ in range(2):
+            result = self.invoke(bootstrap)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = json.loads((destination / ".msv2-source.json").read_text())
+        self.assertEqual(receipt["commit"], "fixed-parser")
+        self.assertEqual(receipt["source_kind"], "pinned_files")
+        self.assertEqual(
+            set(receipt["files"]), {"models/bisenet.py", "models/resnet.py", "LICENSE"}
+        )
+        for item in lock["head_parser"]["files"]:
+            self.assertEqual(
+                hashlib.sha256((destination / item["path"]).read_bytes()).hexdigest(),
+                item["sha256"],
+            )
+        calls = (self.root / "interpreter-calls").read_bytes()
+        (destination / "models/resnet.py").write_text("changed parser source")
+        rejected = self.invoke(bootstrap)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Installed source was changed", rejected.stderr)
+        self.assertEqual((self.root / "interpreter-calls").read_bytes(), calls)
+
+    def test_head_parser_weight_size_mismatch_rejects_before_runtime_import(self):
+        bootstrap = self.bootstrap_fixture()
+        lock_file = self.app / "upstream.lock.json"
+        lock = json.loads(lock_file.read_text())
+        lock["head_parser_weight"]["bytes"] += 1
+        lock_file.write_text(json.dumps(lock))
+        rejected = self.invoke(bootstrap)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Head parser weight size differs", rejected.stderr)
+        self.assertFalse((self.root / "interpreter-calls").exists())
 
     def test_setuptools_metadata_rewrite_preserves_source_integrity(self):
         bootstrap = self.bootstrap_fixture()

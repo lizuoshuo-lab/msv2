@@ -134,6 +134,17 @@ def run_pipeline(source, options, root=None, name=None):
             swinir_weight=os.environ.get(
                 "MSV2_SWINIR_WEIGHT", str(root / "weights" / WEIGHT_NAME)
             ),
+            head_detector_weight=os.environ.get(
+                "MSV2_HEAD_DETECTOR_WEIGHT",
+                str(root / "weights/face_detection_yunet_2023mar.onnx"),
+            ),
+            head_parser_source=os.environ.get(
+                "MSV2_HEAD_PARSER_SOURCE", str(root / "vendor/head-parser")
+            ),
+            head_parser_weight=os.environ.get(
+                "MSV2_HEAD_PARSER_WEIGHT",
+                str(root / "weights/face_parsing_resnet18.pt"),
+            ),
         )
         job_file = run / "job.json"
         save_json(job_file, job)
