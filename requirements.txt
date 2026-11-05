@@ -1,0 +1,17 @@
+# CPU-side packages. PyTorch CUDA wheels are installed explicitly by bootstrap.sh.
+numpy==1.26.4
+scipy==1.14.1
+Pillow==11.1.0
+plyfile==1.1
+tqdm==4.70.1
+open3d==0.18.0
+timm==0.9.5
+einops==0.8.1
+opencv-python-headless==4.10.0.84
+matplotlib==3.8.4
+imageio==2.37.0
+PyYAML==6.0.2
+tensorboard==2.19.0
+ninja==1.13.0
+setuptools==75.8.0
+wheel==0.45.1

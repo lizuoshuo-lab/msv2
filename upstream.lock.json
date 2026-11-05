@@ -1,0 +1,30 @@
+{
+  "schema": "msv2-upstream-lock-v1",
+  "mini_splatting2": {
+    "repository": "https://github.com/fatPeter/mini-splatting2",
+    "commit": "5ec9202c2db7d900728bfc09733e85467cff885e",
+    "archive": "https://codeload.github.com/fatPeter/mini-splatting2/tar.gz/5ec9202c2db7d900728bfc09733e85467cff885e",
+    "sha256": "7ea4ae14faf45d18b62dbd85cdd64129e3739868f4ddc2a9e74c080d7b1cf3b4",
+    "directory": "mini-splatting2",
+    "compatibility_patch": "submodules/simple-knn/simple_knn.cu: explicit <cfloat> include for CUDA 12.8; no training Python changes"
+  },
+  "swinir": {
+    "repository": "https://github.com/JingyunLiang/SwinIR",
+    "commit": "6545850fbf8df298df73d81f3e8cba638787c8bd",
+    "archive": "https://codeload.github.com/JingyunLiang/SwinIR/tar.gz/6545850fbf8df298df73d81f3e8cba638787c8bd",
+    "sha256": "0f0614e1f432ef3ecbdc1d43d6d7160e2d9b90f97474d9bc624ea1bd0119c04a",
+    "directory": "SwinIR"
+  },
+  "swinir4_weight": {
+    "file": "003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth",
+    "url": "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth",
+    "sha256": "99adfa91350a84c99e946c1eb3d8fce34bc28f57d807b09dc8fe40a316328c0a"
+  },
+  "runtime": {
+    "python": ">=3.10,<3.12",
+    "torch": "2.7.1+cu128",
+    "torchvision": "0.22.1+cu128",
+    "cuda_toolkit": "12.8",
+    "cuda_extensions": ["simple-knn", "diff-gaussian-rasterization", "diff-gaussian-rasterization_ms", "fused-ssim"]
+  }
+}
