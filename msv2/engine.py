@@ -554,8 +554,11 @@ class Engine:
                         cache_pixel_error=0,
                     )
                 )
-        # Validate full-size loss and backward before starting optimization.
-        backward_level = 1
+        # The native 4x run starts with half-size warmup, not full-size raw
+        # SfM splats. Test that actual first stage; both resolutions retain
+        # their pixel/projection checks above. This does not certify the
+        # later full-size training working set after native refinement.
+        backward_level = 2 if scale == 4 else 1
         c = LazyCamera(rows[len(rows) // 2], 0, backward_level)
         torch.cuda.reset_peak_memory_stats()
         start = time.monotonic()
@@ -600,6 +603,9 @@ class Engine:
             )
         shutil.copy2(__file__, run / "training-adapter.py")
         m, Scene = self.module_for(scale)
+        from .memory import wrap_training_render
+
+        m.render_imp = wrap_training_render(m.render_imp, self.repo)
         args, data, opt, pipe = self.options(scale)
         assert (
             args.imp_metric == self.config["importance_metric"]
@@ -629,6 +635,7 @@ class Engine:
             if scale == 4
             else "native",
             native_sources_unchanged=True,
+            image_buffer_offload=m.render_imp.memory_stats,
             adapter_sha256=sha(run / "training-adapter.py"),
         )
         save(run / "execution.json", state)
