@@ -175,6 +175,86 @@ class DeploymentTests(unittest.TestCase):
             (self.root / "interpreter-calls").read_bytes().split(b"\0")[:-1], calls
         )
 
+    def test_setuptools_metadata_rewrite_preserves_source_integrity(self):
+        bootstrap = self.bootstrap_fixture()
+        source = self.root / "vendor/mini-splatting2"
+        name = "submodules/simple-knn/simple_knn.egg-info/PKG-INFO"
+        metadata_file = source / name
+        metadata_file.parent.mkdir(parents=True)
+        original = b"Metadata-Version: 2.1\n"
+        metadata_file.write_bytes(original)
+        receipt_path = source / ".msv2-source.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["files"][name] = hashlib.sha256(original).hexdigest()
+        receipt_path.write_text(json.dumps(receipt))
+        # A successful wheel build rewrites packaging metadata in-place.
+        metadata_file.write_text("Metadata-Version: 2.4\n")
+        for _ in range(2):
+            result = self.invoke(bootstrap)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            saved = json.loads(receipt_path.read_text())
+            self.assertNotIn(name, saved["files"])
+            self.assertIn(name, saved["generated_metadata"])
+            self.assertEqual(saved["files"]["source.py"], receipt["files"]["source.py"])
+        # A similarly named real file outside .egg-info must still be checked.
+        protected = source / "PKG-INFO"
+        protected.write_bytes(original)
+        saved["files"]["PKG-INFO"] = hashlib.sha256(original).hexdigest()
+        receipt_path.write_text(json.dumps(saved))
+        protected.write_text("changed")
+        rejected = self.invoke(bootstrap)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Installed source was changed", rejected.stderr)
+
+    def cuda_discovery_fixture(self):
+        bootstrap = self.bootstrap_fixture()
+        self.environment.pop("MSV2_PYTHON")
+        self.environment.pop("CUDA_HOME", None)
+        self.environment["HOME"] = str(self.folder / "host home")
+        host_python = self.folder / "host python"
+        self.script(
+            host_python,
+            'if [[ "$1" == -c ]]; then exit 0; fi\n'
+            'printf "%s" "$CUDA_HOME" > "$MSV2_ROOT/discovered-cuda"\n'
+            "cat >/dev/null\nexit 67\n",
+        )
+        self.environment["MSV2_BOOTSTRAP_PYTHON"] = str(host_python)
+        wrong = self.folder / "wrong toolkit/bin/nvcc"
+        self.script(
+            wrong, 'printf "Cuda compilation tools, release 12.4, V12.4.93\\n"\n'
+        )
+        self.environment["PATH"] = (
+            str(wrong.parent) + os.pathsep + self.environment["PATH"]
+        )
+        toolkit = (
+            Path(self.environment["HOME"]) / ".local/share/runtime/cuda-toolkit-12.8"
+        )
+        self.script(
+            toolkit / "bin/nvcc",
+            'printf "Cuda compilation tools, release 12.8, V12.8.93\\n"\n',
+        )
+        return bootstrap, toolkit
+
+    def test_cuda_discovery_finds_user_toolkit_and_skips_wrong_path_version(self):
+        bootstrap, toolkit = self.cuda_discovery_fixture()
+        result = self.invoke(bootstrap)
+        self.assertEqual(result.returncode, 67, result.stdout + result.stderr)
+        self.assertEqual((self.root / "discovered-cuda").read_text(), str(toolkit))
+        self.assertFalse((self.root / ".venv").exists())
+
+    def test_explicit_incompatible_cuda_home_is_not_replaced(self):
+        bootstrap, _ = self.cuda_discovery_fixture()
+        explicit = self.folder / "explicit wrong toolkit"
+        self.script(
+            explicit / "bin/nvcc",
+            'printf "Cuda compilation tools, release 12.4, V12.4.93\\n"\n',
+        )
+        self.environment["CUDA_HOME"] = str(explicit)
+        result = self.invoke(bootstrap)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires CUDA Toolkit 12.8", result.stderr)
+        self.assertFalse((self.root / "discovered-cuda").exists())
+
     def test_missing_system_tools_use_noninteractive_sudo_without_touching_host(self):
         bootstrap = self.bootstrap_fixture(tools=False)
         for name in (

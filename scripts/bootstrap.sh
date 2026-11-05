@@ -71,17 +71,27 @@ else
   for executable in g++ make; do
     command -v "$executable" >/dev/null || { echo "Build tool missing: $executable. Install git and build-essential." >&2; exit 1; }
   done
+  cuda_128() {
+    [[ -x "$1/bin/nvcc" ]] && "$1/bin/nvcc" --version 2>/dev/null | grep -Eq 'release 12\.8([ ,]|$)'
+  }
   if [[ -z "${CUDA_HOME:-}" ]]; then
+    cuda_candidates=()
     if command -v nvcc >/dev/null; then
-      CUDA_HOME="$(dirname -- "$(dirname -- "$(readlink -f -- "$(command -v nvcc)")")")"
-    else
-      for cuda_candidate in "$MSV2_ROOT/toolchains/cuda-12.8" /usr/local/cuda-12.8 /usr/local/cuda "$HOME/.local/cuda-12.8"; do
-        if [[ -x "$cuda_candidate/bin/nvcc" ]]; then CUDA_HOME="$cuda_candidate"; break; fi
-      done
+      cuda_candidates+=("$(dirname -- "$(dirname -- "$(readlink -f -- "$(command -v nvcc)")")")")
     fi
+    cuda_candidates+=("$MSV2_ROOT/toolchains/cuda-12.8" "$HOME/.local/cuda-12.8")
+    # User-installed toolkits may not be on a noninteractive SSH session's PATH.
+    # These bounded globs cover common user data locations without sourcing env files.
+    for nvcc_candidate in "$HOME"/.local/share/cuda*/bin/nvcc "$HOME"/.local/share/*/cuda*/bin/nvcc; do
+      if [[ -x "$nvcc_candidate" ]]; then cuda_candidates+=("$(dirname -- "$(dirname -- "$nvcc_candidate")")"); fi
+    done
+    cuda_candidates+=(/usr/local/cuda-12.8 /usr/local/cuda)
+    for cuda_candidate in "${cuda_candidates[@]}"; do
+      if cuda_128 "$cuda_candidate"; then CUDA_HOME="$cuda_candidate"; break; fi
+    done
   fi
   [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]] || { echo 'CUDA Toolkit 12.8 compiler missing. Install the NVIDIA toolkit or set CUDA_HOME; the PyTorch CUDA wheel alone does not include nvcc.' >&2; exit 1; }
-  "$CUDA_HOME/bin/nvcc" --version | grep -q 'release 12.8' || { echo 'This pinned runtime requires CUDA Toolkit 12.8.' >&2; exit 1; }
+  cuda_128 "$CUDA_HOME" || { echo 'This pinned runtime requires CUDA Toolkit 12.8.' >&2; exit 1; }
   export CUDA_HOME PATH="$CUDA_HOME/bin:$PATH"
 fi
 export MSV2_SOURCE_DIR="${MSV2_SOURCE_DIR:-$MSV2_ROOT/vendor/mini-splatting2}"
@@ -112,6 +122,10 @@ def fetch(url, path, expected):
         except Exception:
             if attempt==2:raise
             time.sleep(attempt+1)
+def generated_metadata(name):
+    # Setuptools rewrites archive-bundled metadata when building a wheel.
+    # Keep every Python/CUDA/C++ source protected, including extension sources.
+    return any(part.endswith('.egg-info') for part in Path(name).parts)
 def source(key, variable):
     entry=lock[key];dest=Path(os.environ[variable]);receipt=dest/'.msv2-source.json'
     if dest.exists():
@@ -120,9 +134,20 @@ def source(key, variable):
         saved=json.loads(receipt.read_text())
         if saved['commit']!=entry['commit'] or saved['archive_sha256']!=entry['sha256']:
             raise RuntimeError('Existing source version differs from the lock: '+str(dest))
+        ignored=sorted(set(saved.get('generated_metadata',[]))|
+                       {name for name in saved['files'] if generated_metadata(name)})
         for name,expected in saved['files'].items():
+            if generated_metadata(name):continue
             if not (dest/name).is_file() or digest(dest/name)!=expected:
                 raise RuntimeError('Installed source was changed: '+str(dest/name))
+        if any(generated_metadata(name) for name in saved['files']):
+            # Upgrade an earlier receipt after validating all real sources.
+            saved['files']={name:expected for name,expected in saved['files'].items()
+                            if not generated_metadata(name)}
+            saved['generated_metadata']=ignored
+            temporary=receipt.with_suffix(receipt.suffix+'.tmp')
+            temporary.write_text(json.dumps(saved,indent=2)+'\n')
+            temporary.replace(receipt)
         return
     archive=root/'downloads'/(entry['directory']+'-'+entry['commit']+'.tar.gz')
     fetch(entry['archive'],archive,entry['sha256'])
@@ -143,8 +168,12 @@ def source(key, variable):
         before=digest(target);text=target.read_text()
         if '#include <cfloat>' not in text:target.write_text('#include <cfloat>\n'+text)
         patches.append(dict(path=str(target.relative_to(extracted)),before_sha256=before,after_sha256=digest(target),change='Explicit standard cfloat header for CUDA 12.8'))
-    files={str(p.relative_to(extracted)):digest(p) for p in sorted(extracted.rglob('*')) if p.is_file()}
-    data=dict(repository=entry['repository'],commit=entry['commit'],archive_sha256=entry['sha256'],compatibility_patches=patches,files=files)
+    archived_files=[p for p in sorted(extracted.rglob('*')) if p.is_file()]
+    files={str(p.relative_to(extracted)):digest(p) for p in archived_files
+           if not generated_metadata(p.relative_to(extracted))}
+    ignored=[str(p.relative_to(extracted)) for p in archived_files
+             if generated_metadata(p.relative_to(extracted))]
+    data=dict(repository=entry['repository'],commit=entry['commit'],archive_sha256=entry['sha256'],compatibility_patches=patches,files=files,generated_metadata=ignored)
     (extracted/'.msv2-source.json').write_text(json.dumps(data,indent=2)+'\n')
     extracted.replace(dest)
     staging.rmdir()
