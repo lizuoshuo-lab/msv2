@@ -37,6 +37,7 @@ PARSER_SOURCE_FILES = {
     ),
 }
 HEAD_LABELS = (*range(1, 14), 17, 18)
+FACE_LABELS = tuple(range(1, 14))
 HEAD_EXPANSION = dict(
     horizontal_face_height_fraction=0.7,
     top_face_height_fraction=0.6,
@@ -265,7 +266,12 @@ class HeadDetector:
 class HeadPixelExtractor:
     """Existing yakhyo 19-label head parsing on CPU, localized by 2D boxes."""
 
-    def __init__(self, parser_source, parser_weight, detector_weight):
+    def __init__(
+        self, parser_source, parser_weight, detector_weight, *, mask_scope="head"
+    ):
+        if mask_scope not in ("head", "face"):
+            raise ValueError("mask_scope must be head or face")
+        self.mask_scope = mask_scope
         # Validate every asset before importing optional inference packages.
         parser_assets = verify_head_parser(parser_source, parser_weight)
         detector_assets = verify_head_detector(detector_weight)
@@ -292,9 +298,14 @@ class HeadPixelExtractor:
             detector=detector_assets,
             device="cpu",
             cpu_threads=2,
-            head_labels=list(HEAD_LABELS),
-            excluded_labels=[0, 14, 15, 16],
-            label_scope="face, facial features, ears, hair and hat; no neck or clothes",
+            mask_scope=mask_scope,
+            head_labels=list(FACE_LABELS if mask_scope == "face" else HEAD_LABELS),
+            excluded_labels=[0, 14, 15, 16, 17, 18]
+            if mask_scope == "face"
+            else [0, 14, 15, 16],
+            label_scope="face and facial features/ears; no hair, hat, neck or clothes"
+            if mask_scope == "face"
+            else "face, facial features, ears, hair and hat; no neck or clothes",
             checkpoint_load="strict complete state_dict, weights_only=True; backbone constructor weights=None",
         )
 
@@ -319,6 +330,13 @@ class HeadPixelExtractor:
 
     def regions(self, rgb):
         rgb = _rgb(rgb)
+        scope = getattr(self, "mask_scope", "head")
+        if scope not in ("head", "face"):
+            raise ValueError("mask_scope must be head or face")
+        selected_labels = FACE_LABELS if scope == "face" else HEAD_LABELS
+        excluded_labels = (
+            [0, 14, 15, 16, 17, 18] if scope == "face" else [0, 14, 15, 16]
+        )
         height, width = rgb.shape[:2]
         source_sha = _array_sha(rgb)
         boxes, detection = self.detector.boxes(rgb)
@@ -338,7 +356,7 @@ class HeadPixelExtractor:
             native_mask = (
                 np.array(
                     Image.fromarray(
-                        np.isin(labels, HEAD_LABELS).astype(np.uint8) * 255
+                        np.isin(labels, selected_labels).astype(np.uint8) * 255
                     ).resize((x1 - x0, y1 - y0), Image.Resampling.NEAREST)
                 )
                 > 0
@@ -353,6 +371,7 @@ class HeadPixelExtractor:
             )
             record = dict(
                 detection_number=number,
+                mask_scope=scope,
                 segmentation_roi_native=list(bbox),
                 segmentation_native_wh=[x1 - x0, y1 - y0],
                 segmentation_input_wh=[512, 512],
@@ -367,7 +386,9 @@ class HeadPixelExtractor:
             )
             records.append(record)
             if tight is not None:
-                result.append(dict(bbox_native=tight, mask_native=full_mask))
+                result.append(
+                    dict(bbox_native=tight, mask_native=full_mask, mask_scope=scope)
+                )
         if _array_sha(rgb) != source_sha:
             raise RuntimeError("Head pixel extraction changed original RGB")
         return result, dict(
@@ -383,9 +404,10 @@ class HeadPixelExtractor:
             device="cpu",
             cpu_threads=2,
             head_count=len(result),
+            mask_scope=scope,
             parser_calls=len(boxes),
-            head_labels=list(HEAD_LABELS),
-            excluded_labels=[0, 14, 15, 16],
+            head_labels=list(selected_labels),
+            excluded_labels=excluded_labels,
             preprocessing="PIL RGB BILINEAR512, float32 /255, ImageNet mean/std; segmentation only, never SR input",
             geometry_model_used=False,
             masks_used_for_training_loss=False,

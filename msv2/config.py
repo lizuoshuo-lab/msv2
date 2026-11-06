@@ -68,8 +68,11 @@ def load_config(path=None, overrides=None):
         raise ValueError("scales must be a nonempty subset of [1, 2, 4]")
     if options["importance_metric"] not in ("outdoor", "indoor"):
         raise ValueError("importance_metric must be outdoor or indoor")
-    if options["sr_region"] not in ("head", "full"):
-        raise ValueError("sr_region must be head or full")
+    # Accept the earlier experimental option without restoring crop cameras.
+    if options["sr_region"] == "head":
+        options["sr_region"] = "face"
+    if options["sr_region"] not in ("face", "full"):
+        raise ValueError("sr_region must be face or full")
     if options["matching"] not in ("sequential", "exhaustive"):
         raise ValueError("matching must be sequential or exhaustive")
     if (

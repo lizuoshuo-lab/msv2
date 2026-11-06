@@ -10,6 +10,7 @@ import argparse
 import ast
 import copy
 import importlib.util
+import hashlib
 import json
 import math
 import os
@@ -97,6 +98,10 @@ class Engine:
         self.weight = Path(self.job["swinir_weight"])
         # Legacy frozen jobs without this option retain their full-image mode.
         self.sr_region = self.config.get("sr_region", "full")
+        if self.sr_region == "head":
+            self.sr_region = "face"
+        if self.sr_region not in ("full", "face"):
+            raise ValueError("SR region must be full or face")
         runtime_root = self.root.parent.parent
         self.head_detector_weight = Path(
             self.job.get(
@@ -185,11 +190,15 @@ class Engine:
             mask_used=False,
             training_mask_used=False,
             input_composite_mask=False,
-            input_head_mask_used=False,
-            head_training_views_requested=self.sr_region == "head"
-            and 4 in self.config["scales"],
-            head_training_views=False,
+            input_face_mask_used=False,
+            mask_scope="face" if self.sr_region == "face" else None,
+            mask_source="existing_digital_human_face_parsing"
+            if self.sr_region == "face"
+            else None,
             sr_region=self.sr_region,
+            view_layout="full4x_mask_composite" if self.sr_region == "face" else "full",
+            additional_training_views=False,
+            full_frame_4x_generated=False,
             crop_used=False,
             background_trained=True,
             source_dimensions=sorted({tuple(r["wh"]) for r in rows}),
@@ -209,64 +218,16 @@ class Engine:
         out = run / "dataset/images"
         out.mkdir(parents=True, exist_ok=True)
         rows = self.native_rows()
-        items = []
-        if scale == 4 and self.sr_region == "head":
+        face_records = None
+        if scale == 4 and self.sr_region == "face":
             sr = read(run / "superresolution.json")
-            native = {row["image"]: row for row in rows}
-            records = {row["name"]: row for row in sr["records"]}
-            assert sr["state"] == "completed" and set(records) == set(native)
-            for name, row in native.items():
-                item = records[name]
-                assert item["native_sha256"] == row["sha256"]
-                assert sha(out / name) == item["output_sha256"] == row["sha256"]
-                items.append(
-                    dict(
-                        name=name,
-                        image_sha256=item["output_sha256"],
-                        native_sha256=row["sha256"],
-                        view_type="full",
-                    )
-                )
-                for head in item["heads"]:
-                    path = out / head["name"]
-                    assert sha(path) == head["output_sha256"]
-                    x0, y0, x1, y1 = head["bbox_native"]
-                    with Image.open(path) as image:
-                        assert image.mode == "RGB" and image.size == (
-                            4 * (x1 - x0),
-                            4 * (y1 - y0),
-                        )
-                    items.append(
-                        dict(
-                            name=head["name"],
-                            image_sha256=head["output_sha256"],
-                            native_sha256=row["sha256"],
-                            view_type="head",
-                        )
-                    )
-            save(
-                run / "pixels.json",
-                dict(
-                    scale=4,
-                    count=len(items),
-                    source_frames=len(rows),
-                    view_count=len(items),
-                    items=items,
-                    full_rgb=True,
-                    training_mask_used=False,
-                    input_composite_mask=any(item["heads"] for item in sr["records"]),
-                    input_head_mask_used=any(item["heads"] for item in sr["records"]),
-                    full_frame_4x_generated=False,
-                    mixed_resolution=True,
-                    sr_region="head",
-                    full_view_scale=1,
-                    head_view_scale=4,
-                ),
+            face_records = {item["name"]: item for item in sr["records"]}
+            assert sr["state"] == "completed" and len(face_records) == len(rows)
+            assert set(face_records) == {row["image"] for row in rows}
+            assert {p.name for p in out.iterdir()} == set(face_records), (
+                "Only complete source-frame RGBs may enter training"
             )
-            print(
-                "PIXELS_READY", scale, len(items), "mixed-resolution views", flush=True
-            )
-            return
+        items = []
         for row in rows:
             src = self.prep / "dataset/images" / row["image"]
             assert sha(src) == row["sha256"]
@@ -287,23 +248,60 @@ class Engine:
                     width * scale,
                     height * scale,
                 )
+            if face_records is not None:
+                item = face_records[row["image"]]
+                assert (
+                    item["native_sha256"] == row["sha256"]
+                    and sha(dst) == item["output_sha256"]
+                )
+                self._verify_face_masks(run, item, row["wh"])
             items.append(
                 dict(name=src.name, native_sha256=row["sha256"], image_sha256=sha(dst))
             )
+        route = self._image_route(scale)
         save(
             run / "pixels.json",
             dict(
                 scale=scale,
                 count=len(rows),
+                source_frames=len(rows),
+                view_count=len(rows),
                 items=items,
                 full_rgb=True,
-                no_mask=True,
-                training_mask_used=False,
-                input_composite_mask=False,
-                sr_region=self.sr_region if scale == 4 else None,
+                no_mask=not route["input_composite_mask"],
+                **route,
             ),
         )
         print("PIXELS_READY", scale, len(rows), flush=True)
+
+    def _image_route(self, scale):
+        face = scale == 4 and self.sr_region == "face"
+        path = self.root / NAMES[4] / "superresolution.json"
+        sr = read(path) if scale == 4 and path.exists() else {}
+        used = face and any(item.get("face_count", 0) for item in sr.get("records", []))
+        return dict(
+            sr_region=self.sr_region if scale == 4 else None,
+            mask_scope="face" if face else None,
+            mask_source="existing_digital_human_face_parsing" if face else None,
+            training_mask_used=False,
+            input_composite_mask=used,
+            input_face_mask_used=used,
+            preprocessing_crop_used=used,
+            view_layout="full4x_mask_composite" if face else f"full{scale}x",
+            additional_training_views=False,
+            full_frame_4x_generated=scale == 4 and sr.get("state") == "completed",
+            one_complete_training_image_per_source=True,
+        )
+
+    def _verify_face_masks(self, run, item, wh):
+        assert item["face_count"] == len(item["faces"])
+        for face in item["faces"]:
+            path = run / "face-masks" / face["mask_name"]
+            assert sha(path) == face["mask_sha256"]
+            with Image.open(path) as mask:
+                assert mask.mode == "L" and list(mask.size) == wh
+                assert mask.getbbox() == tuple(face["bbox_native"])
+                assert sum(mask.histogram()[1:255]) == 0
 
     def options(self, scale):
         from arguments import ModelParams, OptimizationParams, PipelineParams
@@ -337,7 +335,6 @@ class Engine:
     def superresolve(self):
         torch = self.runtime()
         assert sha(self.weight) == WEIGHT_SHA
-        # This stage runs alone in the queue; tiles bound attention memory.
         torch.cuda.set_per_process_memory_fraction(self.config["gpu_memory_fraction"])
         sys.path.insert(0, str(self.swinir))
         official = import_file("main_test_swinir", self.swinir / "main_test_swinir.py")
@@ -350,14 +347,15 @@ class Engine:
             tile_overlap=self.config["sr_tile_overlap"],
         )
         model = official.define_model(args).eval().cuda()
-        detector = None
-        if self.sr_region == "head":
+        extractor = None
+        if self.sr_region == "face":
             from .head import HeadPixelExtractor
 
-            detector = HeadPixelExtractor(
+            extractor = HeadPixelExtractor(
                 self.head_parser_source,
                 self.head_parser_weight,
                 self.head_detector_weight,
+                mask_scope="face",
             )
         run = self.root / NAMES[4]
         out = run / "dataset/images"
@@ -375,24 +373,30 @@ class Engine:
                 tile=self.config["sr_tile"],
                 tile_overlap=self.config["sr_tile_overlap"],
                 sr_region=self.sr_region,
+                mask_scope="face" if extractor is not None else None,
+                mask_source="existing_digital_human_face_parsing"
+                if extractor is not None
+                else None,
                 training_mask_used=False,
                 input_composite_mask=False,
-                input_head_mask_used=False,
-                head_mask_source="existing_digital_human_face_parsing"
-                if self.sr_region == "head"
-                else None,
-                mixed_resolution=self.sr_region == "head",
+                input_face_mask_used=False,
+                additional_training_views=False,
+                full_frame_4x_generated=False,
+                view_layout="full4x_mask_composite"
+                if extractor is not None
+                else "full4x",
             )
         )
-        done = {r["name"]: r for r in state["records"]}
         assert state.get("sr_region", "full") == self.sr_region, (
             "Cannot mix SR input modes in one run"
         )
-        if detector is not None:
-            state["head_pixel_extractor"] = detector.assets
+        done = {r["name"]: r for r in state["records"]}
+        assert len(done) == len(state["records"])
+        if extractor is not None:
+            state["parser_detector_assets"] = extractor.assets
 
         def infer(rgb, crop=False):
-            # Head callbacks receive unmodified original context pixels.
+            # Face ROI callbacks receive unmodified original context pixels.
             # Padding serves only window-8 attention, never input rescaling.
             h, w = rgb.shape[:2]
             x = (
@@ -437,84 +441,98 @@ class Engine:
 
         with torch.inference_mode():
             for row in self.native_rows():
-                src = self.prep / "dataset/images" / row["image"]
-                dst = out / row["image"]
+                src, dst = (
+                    self.prep / "dataset/images" / row["image"],
+                    out / row["image"],
+                )
+                assert sha(src) == row["sha256"]
                 if row["image"] in done:
                     assert done[row["image"]]["native_sha256"] == row["sha256"]
                     assert sha(dst) == done[row["image"]]["output_sha256"]
-                    for head in done[row["image"]].get("heads", []):
-                        assert sha(out / head["name"]) == head["output_sha256"]
-                        assert (
-                            sha(run / "head-masks" / head["mask_name"])
-                            == head["mask_sha256"]
-                        )
+                    if extractor is not None:
+                        self._verify_face_masks(run, done[row["image"]], row["wh"])
                     continue
-                t = time.monotonic()
-                assert sha(src) == row["sha256"]
+                started = time.monotonic()
                 with Image.open(src) as image:
                     rgb = np.array(image.convert("RGB"))
-                calls, head_metadata, heads = [], None, []
-                if detector is None:
+                calls, faces, extraction, composition = [], [], None, None
+                if extractor is None:
                     arr, call = infer(rgb)
                     calls.append(call)
                 else:
-                    from .head import superresolve_head
+                    from .mask_sr import compose_face
 
-                    regions, head_metadata = detector.regions(rgb)
+                    regions, extraction = extractor.regions(rgb)
 
                     def callback(crop):
-                        output, call = infer(crop, crop=True)
+                        result, call = infer(crop, crop=True)
                         calls.append(call)
-                        return output
+                        return result
 
+                    arr, composition = compose_face(
+                        rgb, regions, callback, context_native=32, feather_native=2
+                    )
+                    assert (
+                        composition["full_frame_4x_generated"]
+                        and composition["outside_mask_equal_reference"]
+                    )
+                    assert (
+                        composition["one_complete_training_image"]
+                        and composition["added_views"] == 0
+                    )
+                    assert (
+                        composition["source_rgb_sha256"]
+                        == hashlib.sha256(rgb.tobytes()).hexdigest()
+                    )
+                    assert (
+                        composition["output_rgb_sha256"]
+                        == hashlib.sha256(arr.tobytes()).hexdigest()
+                    )
                     for number, region in enumerate(regions, 1):
-                        bbox, mask = region["bbox_native"], region["mask_native"]
-                        head_rgb, receipt = superresolve_head(
-                            rgb, bbox, callback, mask_native=mask, context_native=32
-                        )
-                        head_name = f"{src.stem}_head_{number:03d}.png"
-                        head_path = out / head_name
-                        temporary = head_path.with_name(head_path.name + ".tmp")
-                        Image.fromarray(head_rgb).save(
-                            temporary, format="PNG", compress_level=3
-                        )
-                        temporary.replace(head_path)
-                        mask_path = run / "head-masks" / head_name
+                        mask = np.asarray(region["mask_native"])
+                        assert mask.dtype == np.bool_ and mask.shape == rgb.shape[:2]
+                        if not mask.any():
+                            continue
+                        mask_name = f"{src.stem}_face_{number:03d}.png"
+                        mask_path = run / "face-masks" / mask_name
                         mask_path.parent.mkdir(parents=True, exist_ok=True)
-                        mask_tmp = mask_path.with_name(mask_path.name + ".tmp")
+                        temporary = mask_path.with_name(mask_path.name + ".tmp")
                         Image.fromarray(mask.astype(np.uint8) * 255).save(
-                            mask_tmp, format="PNG"
+                            temporary, format="PNG"
                         )
-                        mask_tmp.replace(mask_path)
-                        heads.append(
+                        temporary.replace(mask_path)
+                        faces.append(
                             dict(
-                                name=head_name,
-                                bbox_native=bbox,
-                                output_sha256=sha(head_path),
-                                mask_name=head_name,
+                                bbox_native=region["bbox_native"],
+                                mask_name=mask_name,
                                 mask_sha256=sha(mask_path),
-                                receipt=receipt,
+                                mask_pixels=int(mask.sum()),
+                                native_mask_array_sha256=hashlib.sha256(
+                                    mask.tobytes()
+                                ).hexdigest(),
                             )
                         )
-                        del head_rgb
-                    # The complete RGB remains byte-identical at native size.
-                    # Head SR is an additional calibrated input, not a paste
-                    # into a full-resolution-4 background canvas.
-                    shutil.copy2(src, dst)
-                    arr = None
-                if arr is not None:
-                    temporary = dst.with_name(dst.name + ".tmp")
-                    Image.fromarray(arr).save(temporary, format="PNG", compress_level=3)
-                    temporary.replace(dst)
+                assert arr.dtype == np.uint8 and arr.shape == (
+                    rgb.shape[0] * 4,
+                    rgb.shape[1] * 4,
+                    3,
+                )
+                assert sha(src) == row["sha256"]
+                temporary = dst.with_name(dst.name + ".tmp")
+                Image.fromarray(arr).save(temporary, format="PNG", compress_level=3)
+                temporary.replace(dst)
                 item = dict(
                     name=row["image"],
                     native_sha256=row["sha256"],
                     output_sha256=sha(dst),
-                    seconds=time.monotonic() - t,
+                    seconds=time.monotonic() - started,
                     sr_region=self.sr_region,
+                    mask_scope="face" if extractor is not None else None,
+                    face_count=len(faces),
+                    faces=faces,
+                    face_extraction=extraction,
+                    composition=composition,
                     swinir_calls=calls,
-                    head_detection=head_metadata,
-                    heads=heads,
                 )
                 state["records"].append(item)
                 state.update(
@@ -531,21 +549,23 @@ class Engine:
                     flush=True,
                 )
                 del arr, rgb
-        if self.sr_region == "head":
+        state.update(
+            state="completed",
+            finished=now(),
+            source_frames=len(state["records"]),
+            view_count=len(state["records"]),
+            full_frame_4x_generated=True,
+            additional_training_views=False,
+        )
+        if extractor is not None:
+            used = any(r["face_count"] for r in state["records"])
             state.update(
-                head_frames=sum(bool(r["heads"]) for r in state["records"]),
-                no_head_frames=sum(not r["heads"] for r in state["records"]),
-                source_frames=len(state["records"]),
-                head_view_count=sum(len(r["heads"]) for r in state["records"]),
-                view_count=len(state["records"])
-                + sum(len(r["heads"]) for r in state["records"]),
-                full_view_scale=1,
-                head_view_scale=4,
-                input_composite_mask=any(r["heads"] for r in state["records"]),
-                input_head_mask_used=any(r["heads"] for r in state["records"]),
-                full_frame_4x_generated=False,
+                face_frames=sum(bool(r["face_count"]) for r in state["records"]),
+                no_face_frames=sum(not r["face_count"] for r in state["records"]),
+                face_region_count=sum(r["face_count"] for r in state["records"]),
+                input_composite_mask=used,
+                input_face_mask_used=used,
             )
-        state.update(state="completed", finished=now())
         save(p, state)
         self.stage_pixels(4)
 
@@ -556,37 +576,6 @@ class Engine:
         import struct
 
         run = self.root / NAMES[scale]
-        if scale == 4 and self.sr_region == "head":
-            from .head_dataset import build_head_cameras
-
-            inputs = build_head_cameras(
-                self.prep,
-                run,
-                read(run / "superresolution.json")["records"],
-                self.config["holdout"],
-            )
-            save(run / "training-inputs.json", inputs)
-            train_heads = sum(
-                row["view_type"] == "head" and row["split"] == "train"
-                for row in inputs["records"]
-            )
-            plan = read(self.root / "plan.json")
-            plan.update(
-                crop_used=inputs["crop_used"],
-                head_training_views=train_heads > 0,
-                source_frames=inputs["source_frames"],
-                mixed_view_count=inputs["total_views"],
-                full_view_count=inputs["full_views"],
-                head_view_count=inputs["head_views"],
-                train_head_view_count=train_heads,
-                test_head_view_count=inputs["head_views"] - train_heads,
-                skipped_head_view_count=len(inputs.get("skipped_head_views", [])),
-                input_composite_mask=inputs["head_views"] > 0,
-                input_head_mask_used=inputs["head_views"] > 0,
-            )
-            save(self.root / "plan.json", plan)
-            self._rgb_caches(run, inputs["records"], scale)
-            return
         data = run / "dataset"
         sp = data / "sparse/0"
         sp.mkdir(parents=True, exist_ok=True)
@@ -643,9 +632,9 @@ class Engine:
             dict(
                 records=rows,
                 mask_used=False,
-                training_mask_used=False,
-                input_composite_mask=False,
-                sr_region=self.sr_region if scale == 4 else None,
+                **self._image_route(scale),
+                source_frames=len(rows),
+                view_count=len(rows),
                 crop_used=False,
                 background_trained=True,
                 scale=scale,
@@ -654,9 +643,6 @@ class Engine:
                 scaled_intrinsics_readback_verified=True,
             ),
         )
-        self._rgb_caches(run, rows, scale)
-
-    def _rgb_caches(self, run, rows, scale):
         # Exactly PILtoTorch's default RGB resize, including the official warmup level.
         for level in (1, 2):
             cache = run / f"rgb-cache-{level}"
@@ -675,6 +661,16 @@ class Engine:
                     arr = np.array(im.resize(wh))
                 np.save(dst, arr)
             print("CAMERA_CACHE_READY", scale, level, len(rows), flush=True)
+        plan_path = self.root / "plan.json"
+        if scale == 4 and plan_path.exists():
+            plan = read(plan_path)
+            plan.update(
+                **self._image_route(scale),
+                source_frames=len(rows),
+                view_count=len(rows),
+                crop_used=False,
+            )
+            save(plan_path, plan)
 
     def module_for(self, scale):
         self.runtime()
@@ -717,22 +713,7 @@ class Engine:
 
         def configured_reader(*args, **kwargs):
             kwargs["llffhold"] = self.config["holdout"]
-            info = original_reader(*args, **kwargs)
-            if scale == 4 and self.sr_region == "head":
-                from .head_dataset import split_camera_infos
-                from scene.dataset_readers import getNerfppNorm
-
-                train, test, full_train = split_camera_infos(
-                    info.train_cameras + info.test_cameras, rows
-                )
-                # Derived crops share source identities. They never move a
-                # held-out source into training or change scene normalization.
-                info = info._replace(
-                    train_cameras=train,
-                    test_cameras=test,
-                    nerf_normalization=getNerfppNorm(full_train),
-                )
-            return info
+            return original_reader(*args, **kwargs)
 
         scene.sceneLoadTypeCallbacks["Colmap"] = configured_reader
         native_scene = scene.Scene
@@ -764,50 +745,23 @@ class Engine:
         args, data, opt, pipe = self.options(scale)
         xyz, rgb, _ = read_points3D_binary(str(run / "dataset/sparse/0/points3D.bin"))
         assert len(xyz) >= 4 and np.isfinite(xyz).all()
-        normalization_rows = [r for r in rows if r["split"] == "train"]
-        if scale == 4 and self.sr_region == "head":
-            normalization_rows = [
-                r for r in normalization_rows if r["view_type"] == "full"
-            ]
         centers = np.asarray(
-            [np.linalg.inv(r["w2c"])[:3, 3] for r in normalization_rows]
+            [np.linalg.inv(r["w2c"])[:3, 3] for r in rows if r["split"] == "train"]
         )
         extent = float(np.linalg.norm(centers - centers.mean(0), axis=1).max() * 1.1)
         g = GaussianModel(0)
         g.create_from_pcd(BasicPointCloud(xyz, rgb / 255.0, np.zeros_like(xyz)), extent)
         g.training_setup(opt)
         checks = []
-        indices = (0, len(rows) // 2, len(rows) - 1)
-        if scale == 4 and self.sr_region == "head":
-            groups = list(dict.fromkeys(row["source_frame"] for row in rows))
-            selected = {groups[0], groups[len(groups) // 2], groups[-1]}
-            indices = [
-                i for i, row in enumerate(rows) if row["source_frame"] in selected
-            ]
         for level in (2, 1):
-            for index in indices:
+            for index in (0, len(rows) // 2, len(rows) - 1):
                 c = LazyCamera(rows[index], index, level)
                 k = c.K
                 w = np.asarray(c.row["w2c"])
-                projection_points = xyz
-                if scale == 4 and self.sr_region == "head":
-                    # A textureless head can have no SfM feature inside its
-                    # crop. Check calibrated rays as well as actual points;
-                    # these algebraic probes never initialize Gaussians.
-                    pixels = np.array(
-                        [
-                            [0.2 * c.width, 0.2 * c.height, 1],
-                            [0.8 * c.width, 0.8 * c.height, 1],
-                            [0.5 * c.width, 0.5 * c.height, 1],
-                        ]
-                    )
-                    rays = pixels @ np.linalg.inv(k).T
-                    probes = (rays - w[:3, 3]) @ w[:3, :3]
-                    projection_points = np.concatenate([xyz, probes])
-                q = projection_points @ w[:3, :3].T + w[:3, 3]
+                q = xyz @ w[:3, :3].T + w[:3, 3]
                 good = q[:, 2] > c.znear
                 q = q[good]
-                xx = projection_points[good]
+                xx = xyz[good]
                 expected = q @ k.T
                 expected = expected[:, :2] / expected[:, 2:] - 0.5
                 hp = (
@@ -829,10 +783,6 @@ class Engine:
                     & (expected[:, 1] >= 0)
                     & (expected[:, 1] < c.height)
                 )
-                if not np.any(inside):
-                    raise ValueError(
-                        "Preflight view has no visible sparse point: " + c.image_name
-                    )
                 error = float(
                     np.max(np.abs(uv.cpu().numpy()[inside] - expected[inside]))
                 )
@@ -878,8 +828,6 @@ class Engine:
             backward_level=backward_level,
             backward_wh=[c.width, c.height],
             full_target_wh=rows[0]["wh"],
-            target_dimensions=sorted({tuple(row["wh"]) for row in rows}),
-            mixed_resolution=scale == 4 and self.sr_region == "head",
             peak_reserved_gib=peak,
             model_and_loss_unmodified=True,
             training_completed=False,
@@ -943,30 +891,6 @@ class Engine:
 
         def report(tb, iteration, l1, loss, *rest):
             native_report(tb, iteration, l1, loss, *rest)
-            if (
-                scale == 4
-                and self.sr_region == "head"
-                and iteration == args.depth_reinit_iter
-            ):
-                from .head_dataset import depth_sampling_capacity
-
-                active_views = Scene.latest.getTrainCameras_warn_up(
-                    iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                )
-                capacity = depth_sampling_capacity(
-                    len(Scene.latest.gaussians.get_xyz) * args.num_depth_factor,
-                    [
-                        dict(frame=c.image_name, wh=[c.width, c.height])
-                        for c in active_views
-                    ],
-                )
-                capacity.update(iteration=iteration, native_sampler_unchanged=True)
-                save(run / "depth-capacity.json", capacity)
-                if not capacity["passed"]:
-                    raise RuntimeError(
-                        "Native depth sampling exceeds input-view pixel capacity; "
-                        "see " + str(run / "depth-capacity.json")
-                    )
             c = LazyCamera.last
             if scale == 4 and c is not None and c.level == 1:
                 torch.cuda.empty_cache()

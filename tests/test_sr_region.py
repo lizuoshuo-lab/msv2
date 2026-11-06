@@ -1,4 +1,4 @@
-"""Source-group and export/report contracts for mixed full1x/head4x input."""
+"""One complete composite image and camera per source frame."""
 
 from copy import deepcopy
 from types import SimpleNamespace
@@ -9,19 +9,22 @@ import pytest
 from msv2.config import load_config
 from msv2.engine import Engine
 from msv2.export import camera_input_mapping, camera_records
-from msv2.head import crop_intrinsics
 from msv2.io import read_json, save_json
-from msv2.report import publish, view_summary
+from msv2.report import publish, route_metadata, view_summary
 
 
-@pytest.mark.parametrize("region", ["head", "full"])
-def test_region_is_an_explicit_validated_input_choice(region):
+@pytest.mark.parametrize("region", ["face", "full"])
+def test_region_is_an_explicit_input_choice(region):
     assert load_config()["sr_region"] == "full"
     assert load_config(overrides={"sr_region": region})["sr_region"] == region
 
 
-@pytest.mark.parametrize("region", ["face", "parse"])
-def test_unpublished_semantic_modes_are_not_runtime_options(region):
+def test_old_region_name_maps_to_whole_image_composition():
+    assert load_config(overrides={"sr_region": "head"})["sr_region"] == "face"
+
+
+@pytest.mark.parametrize("region", ["parse", "crop", "other"])
+def test_unknown_regions_are_rejected(region):
     with pytest.raises(ValueError, match="sr_region"):
         load_config(overrides={"sr_region": region})
 
@@ -58,197 +61,161 @@ def source_rows(image):
     ]
 
 
-def mixed_rows(base, head_count):
-    rows = []
-    for original in base:
-        row = deepcopy(original)
-        row.update(source_frame=row["frame"], source_name=row["name"], view_type="full")
-        rows.append(row)
-    for row in rows[:head_count]:
-        head = deepcopy(row)
-        head.update(
-            frame=row["frame"] + "_head_001",
-            name=row["frame"] + "_head_001.png",
-            view_type="head",
-            bbox_native=[10, 5, 30, 25],
-            wh=[80, 80],
-        )
-        head["K"] = crop_intrinsics(row["K"], head["bbox_native"]).tolist()
-        rows.append(head)
+def full4_rows(base):
+    rows = deepcopy(base)
+    for row in rows:
+        row["wh"] = [4 * v for v in row["wh"]]
+        row["K"] = (np.diag([4.0, 4.0, 1.0]) @ np.asarray(row["K"])).tolist()
     return rows
 
 
+def sr_records(base, face_counts):
+    return dict(
+        state="completed",
+        view_layout="full4x_mask_composite",
+        mask_scope="face",
+        records=[
+            dict(name=r["name"], face_count=count)
+            for r, count in zip(base, face_counts)
+        ],
+    )
+
+
 @pytest.mark.parametrize(
-    "region,head_count,generated_count",
+    "mode,face_counts",
     [
-        ("head", 0, 0),
-        ("head", 3, 3),
-        ("head", 0, 3),
-        ("head", 1, 1),
-        ("head", 2, 3),
-        ("full", 0, 0),
+        ("full", [0, 0, 0]),
+        ("face", [1, 1, 1]),
+        ("face", [0, 0, 0]),
+        ("face", [1, 0, 0]),
     ],
 )
-def test_report_counts_real_sources_and_training_views(
-    tmp_path, region, head_count, generated_count
+def test_report_retains_source_frame_count_and_whole_image_training(
+    tmp_path, mode, face_counts
 ):
     engine = SimpleNamespace(
         root=tmp_path / "run",
         record=tmp_path / "export",
-        config=load_config(overrides={"sr_region": region}),
+        config=load_config(overrides={"sr_region": mode}),
         iterations=18000,
     )
     source = tmp_path / "source.png"
-    source.write_bytes(b"read-only report fixture")
+    source.write_bytes(b"report fixture, not a rendered image")
     base = source_rows(source)
     for scale, name in [(1, "original"), (2, "interpolation2x"), (4, "swinir4x")]:
-        records = (
-            mixed_rows(base, head_count)
-            if scale == 4 and region == "head"
-            else deepcopy(base)
-        )
-        metadata = {"records": records}
-        if scale == 4 and region == "head":
-            metadata.update(
-                generated_head_view_count=generated_count,
-                initial_depth_quota=20,
-                skipped_head_views=[
-                    dict(
-                        name=row["frame"] + "_head_001.png",
-                        source_frame=row["frame"],
-                        reason="below_initial_native_depth_quota",
-                        P=4,
-                        q_at_skip=20,
-                    )
-                    for row in base[head_count:generated_count]
-                ],
-            )
-        save_json(engine.root / name / "training-inputs.json", metadata)
+        rows = full4_rows(base) if scale == 4 else deepcopy(base)
+        save_json(engine.root / name / "training-inputs.json", dict(records=rows))
         save_json(
             engine.record / name / "delivery.json",
-            dict(parity_passed=True, cameras=len(records), points=100),
+            dict(parity_passed=True, cameras=3, points=100),
         )
         save_json(
             engine.record / name / "metrics.json",
             dict(
                 execution=dict(
-                    state="training_completed",
-                    train_frames=sum(r["split"] == "train" for r in records),
-                    test_frames=sum(r["split"] == "test" for r in records),
+                    state="training_completed", train_frames=2, test_frames=1
                 ),
-                means={"test": {"psnr": 20, "ssim": 0.8}},
+                means={"test": dict(psnr=20.0, ssim=0.8)},
             ),
         )
-    sr_records = [
-        dict(
-            name=row["name"],
-            heads=[{"name": row["frame"] + "_head_001.png"}]
-            if i < generated_count
-            else [],
-        )
-        for i, row in enumerate(base)
-    ]
     save_json(
-        engine.root / "swinir4x/superresolution.json",
-        dict(
-            state="completed",
-            sr_region=region,
-            records=sr_records,
-            head_mask_source="existing_digital_human_face_parsing"
-            if region == "head"
-            else None,
-        ),
+        engine.root / "swinir4x/superresolution.json", sr_records(base, face_counts)
     )
     publish(engine, [1, 2, 4], {})
     summary = read_json(engine.record / "comparison.json")
     variant = summary["variants"]["swinir4x"]
     assert summary["source_frames"] == 3
-    assert variant["source_frames"] == 3 and variant["view_count"] == 3 + head_count
-    assert variant["full_views"] == 3 and variant["head_views"] == head_count
-    assert variant["train_source_frames"] == 2 and variant["test_source_frames"] == 1
-    assert variant["training_mask_used"] is False
-    assert variant["input_composite_mask"] is (region == "head" and head_count > 0)
-    assert variant["input_head_mask_used"] is (region == "head" and head_count > 0)
-    assert variant["input_roi_composite"] is (region == "head" and head_count > 0)
-    assert variant["full_frame_4x_generated"] is (region == "full")
-    text = (engine.record / "comparison.html").read_text(encoding="utf-8")
-    if region == "head":
-        assert variant["full_view_scale"] == 1
-        assert variant["generated_head_view_count"] == generated_count
-        assert variant["skipped_head_view_count"] == generated_count - head_count
-        assert "其余 Lanczos" not in text and "纯 Lanczos 四倍" not in text
-        if head_count:
-            assert variant["head_view_scale"] == 4
-            assert variant["native_footprint_limitation"]
-            if head_count == 1:
-                assert variant["head_train_views"] == 0
-                assert variant["head_test_views"] == 1
-                assert variant["input_route"] == "full1x_head4x_holdout_only"
-                assert variant["head_sr_training_used"] is False
-                assert "头部 mask 仅留出评估" in variant["label"]
-            else:
-                assert variant["input_route"] == "full1x_head4x"
-                assert variant["head_sr_training_used"] is True
-        elif generated_count:
-            assert "初始深度配额跳过" in variant["label"]
-            assert "no_head" not in variant["label"]
-            assert variant["input_route"] == "full1x_all_heads_capacity_skipped"
-            assert variant["head_sr_training_used"] is False
-            assert variant["skipped_head_reasons"] == {
-                "below_initial_native_depth_quota": 3
-            }
-            assert "头框像素少于初始深度采样配额" in text
-        else:
-            assert "仅完整原图1倍" in variant["label"]
-            assert variant["input_route"] == "full1x_no_head"
+    assert (
+        variant["source_frames"] == variant["view_count"] == variant["full_views"] == 3
+    )
+    assert variant["head_views"] == 0
+    assert variant["train_views"] == 2 and variant["test_views"] == 1
+    assert (
+        not variant["additional_training_views"] and not variant["training_crop_used"]
+    )
+    assert not variant["training_mask_used"]
+    assert variant["full_view_scale"] == 4 and variant["full_frame_4x_generated"]
+    assert variant["input_composite_mask"] is (mode == "face" and sum(face_counts) > 0)
+    if mode == "face":
+        assert variant["input_route"] == "full4x_mask_composite"
+        assert variant["face_train_frames"] == sum(n > 0 for n in face_counts[1:])
+        assert variant["face_test_frames"] == int(face_counts[0] > 0)
+        assert variant["outside_mask_reference"] == "Original full-image Lanczos4"
+        if not sum(face_counts):
+            assert "无面部" in variant["label"]
+    assert summary["quality_accepted"] is False
+    html = (engine.record / "comparison.html").read_text(encoding="utf-8")
+    assert "每帧只有一套整图相机" in html
+    assert "头框四倍视图" not in html
+
+
+@pytest.mark.parametrize("defect", ["duplicate_source", "crop_view", "duplicate_name"])
+def test_duplicate_or_cropped_training_views_are_rejected(defect):
+    rows = source_rows("unused.png")
+    if defect == "duplicate_source":
+        rows[-1]["source_frame"] = rows[0]["frame"]
+    elif defect == "crop_view":
+        rows[-1]["view_type"] = "head"
     else:
-        assert variant["label"] == "整幅 SwinIR 超分四倍"
-        assert variant["full_view_scale"] == 4
-
-
-def test_source_group_split_cannot_be_misreported_as_held_out():
-    base = source_rows("unused.png")
-    rows = mixed_rows(base, 1)
-    rows[-1]["split"] = "train"
-    with pytest.raises(ValueError, match="source frame"):
+        rows[-1]["name"] = rows[0]["name"]
+    with pytest.raises(ValueError):
         view_summary(rows)
-    with pytest.raises(ValueError, match="source split"):
-        camera_input_mapping(rows, "head")
+    with pytest.raises(ValueError):
+        camera_input_mapping(rows, "full")
 
 
-def test_camera_exports_retain_mixed_resolution_and_source_binding():
+def test_composite_camera_is_full_frame_uniform_scale_with_same_pose():
     base = source_rows("unused.png")
-    rows = mixed_rows(base, 1)
+    rows = full4_rows(base)
     cameras = camera_records(rows)
-    full, head = cameras[0], cameras[-1]
-    assert full["source_frame"] == head["source_frame"] == base[0]["frame"]
-    assert full["view_type"] == "full" and head["view_type"] == "head"
-    assert head["native_bbox"] == [10, 5, 30, 25]
-    assert full["position"] == head["position"] and full["rotation"] == head["rotation"]
-    assert head["K"] == crop_intrinsics(base[0]["K"], [10, 5, 30, 25]).tolist()
-    meta = camera_input_mapping(rows, "head")
-    assert meta["full_frame"] is False and meta["training_resolution"] is None
-    assert meta["training_resolutions"] == [[80, 80], [100, 60]]
-    assert meta["source_frames"] == 3 and meta["view_count"] == 4
-    assert meta["view_layout"] == "full1x_head4x"
-    assert meta["input_head_mask_used"] and meta["input_roi_composite"]
-    assert meta["input_composite_mask"] and not meta["full_frame_4x_generated"]
-    assert meta["training_mask_used"] is False
+    assert len(cameras) == len(base) == 3
+    point = np.asarray([0.2, -0.15, 2.0])
+    for original, camera in zip(base, cameras):
+        native_K = np.asarray(original["K"])
+        K = np.asarray(camera["K"])
+        assert camera["width"] == 400 and camera["height"] == 240
+        a = native_K @ point
+        b = K @ point
+        assert np.allclose(b[:2] / b[2], 4 * a[:2] / a[2], atol=1e-12, rtol=0)
+        assert np.array_equal(camera["position"], [0, 0, 0])
+        assert np.array_equal(camera["rotation"], np.eye(3))
+        assert "native_bbox" not in camera
+    data = camera_input_mapping(rows, "face", sr=sr_records(base, [1, 0, 1]))
+    assert data["full_frame"] and data["training_resolution"] == [400, 240]
+    assert data["view_count"] == data["source_frames"] == 3
+    assert data["view_layout"] == "full4x_mask_composite"
+    assert data["input_face_mask_used"] and not data["training_mask_used"]
+    assert not data["crop_views_present"] and not data["additional_training_views"]
 
 
-def test_legacy_camera_json_keeps_original_field_contract():
+@pytest.mark.parametrize(
+    "defect", ["missing", "duplicate", "wrong_layout", "bad_count"]
+)
+def test_composite_provenance_cannot_mislabel_input_views(tmp_path, defect):
+    base = source_rows("unused.png")
+    rows = full4_rows(base)
+    sr = sr_records(base, [1, 1, 1])
+    if defect == "missing":
+        sr["records"].pop()
+    elif defect == "duplicate":
+        sr["records"].append(deepcopy(sr["records"][0]))
+    elif defect == "wrong_layout":
+        sr["view_layout"] = "full1x_head4x"
+    else:
+        sr["records"][0]["face_count"] = -1
+    with pytest.raises(ValueError):
+        camera_input_mapping(rows, "face", sr=sr)
+    engine = SimpleNamespace(root=tmp_path, config={"sr_region": "face"})
+    save_json(tmp_path / "swinir4x/superresolution.json", sr)
+    with pytest.raises(ValueError):
+        route_metadata(engine, 4, rows)
+
+
+def test_standard_camera_json_keeps_original_field_contract():
     rows = source_rows("unused.png")
     cameras = camera_records(rows)
     assert not any(
         key in cameras[0] for key in ("source_frame", "view_type", "native_bbox")
     )
-    assert camera_input_mapping(rows)["training_resolution"] == [100, 60]
-    assert "view_layout" not in camera_input_mapping(rows)
-
-
-def test_test_only_head_cameras_are_not_claimed_as_training_crops():
-    rows = mixed_rows(source_rows("unused.png"), 1)
-    metadata = camera_input_mapping(rows, "head")
-    assert metadata["crop_views_present"] is True
-    assert metadata["training_crop_used"] is False
-    assert metadata["head_train_views"] == 0 and metadata["head_test_views"] == 1
+    data = camera_input_mapping(rows)
+    assert data["training_resolution"] == [100, 60] and data["view_layout"] == "full"

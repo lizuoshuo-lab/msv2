@@ -270,6 +270,51 @@ def test_independent_two_dimensional_rois_keep_source_pixel_coordinates():
     assert metadata["head_count"] == 2
 
 
+def test_face_scope_uses_existing_labels_but_excludes_hair_hat_and_neck():
+    rgb = np.zeros((80, 100, 3), np.uint8)
+    labels = np.zeros((512, 512), np.uint8)
+    labels[128:384, 128:384] = 1
+    labels[64:128, 128:384] = 17
+    labels[32:64, 128:384] = 18
+    labels[384:448, 128:384] = 14
+    labels[448:480, 128:384] = 15
+    labels[480:512, 128:384] = 16
+    default = extractor_with_labels([[20, 10, 84, 74]], labels, [])
+    heads, before = default.regions(rgb)
+    assert before["mask_scope"] == "head"
+    assert heads[0]["bbox_native"] == [36, 14, 68, 58]
+    face = extractor_with_labels([[20, 10, 84, 74]], labels, [])
+    face.mask_scope = "face"
+    faces, metadata = face.regions(rgb)
+    expected = np.zeros((80, 100), bool)
+    expected[26:58, 36:68] = True
+    assert np.array_equal(faces[0]["mask_native"], expected)
+    assert faces[0]["bbox_native"] == [36, 26, 68, 58]
+    assert faces[0]["mask_scope"] == metadata["mask_scope"] == "face"
+    assert metadata["head_labels"] == list(range(1, 14))
+    assert metadata["excluded_labels"] == [0, 14, 15, 16, 17, 18]
+    assert not metadata["geometry_model_used"]
+
+
+def test_face_scope_keeps_ears_and_facial_features_and_handles_no_face_pixels():
+    rgb = np.zeros((48, 64, 3), np.uint8)
+    labels = np.full((512, 512), 13, np.uint8)
+    extractor = extractor_with_labels([[4, 5, 36, 37]], labels, [])
+    extractor.mask_scope = "face"
+    faces, metadata = extractor.regions(rgb)
+    assert faces[0]["bbox_native"] == [4, 5, 36, 37]
+    assert metadata["head_count"] == 1
+    extractor._parse = lambda crop: np.full((512, 512), 17, np.uint8)
+    faces, metadata = extractor.regions(rgb)
+    assert faces == [] and metadata["head_count"] == 0
+    assert metadata["mask_scope"] == "face"
+
+
+def test_scope_is_validated_before_loading_any_assets():
+    with pytest.raises(ValueError, match="mask_scope"):
+        HeadPixelExtractor("absent", "absent", "absent", mask_scope="body")
+
+
 def test_private_parser_import_does_not_replace_swinir_models_or_global_importer(
     tmp_path, monkeypatch
 ):
