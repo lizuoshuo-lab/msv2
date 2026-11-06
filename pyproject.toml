@@ -14,3 +14,6 @@ msv2 = "msv2.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["msv2*"]
+
+[tool.setuptools.package-data]
+msv2 = ["roi_backend.patch"]

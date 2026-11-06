@@ -5,7 +5,7 @@ export MSV2_ROOT="${MSV2_ROOT:-$HOME/msv2}"
 if [[ -f "$MSV2_ROOT/runtime.env" ]]; then
   # Created by this deployment, outside the Git tree.
   declare -A supplied_values=()
-  for variable in MSV2_PYTHON MSV2_SOURCE_DIR MSV2_SWINIR_SOURCE MSV2_SWINIR_WEIGHT MSV2_EXTENSIONS_DIR MSV2_HEAD_DETECTOR_WEIGHT MSV2_HEAD_PARSER_SOURCE MSV2_HEAD_PARSER_WEIGHT; do
+  for variable in MSV2_PYTHON MSV2_SOURCE_DIR MSV2_SWINIR_SOURCE MSV2_SWINIR_WEIGHT MSV2_EXTENSIONS_DIR MSV2_HEAD_DETECTOR_WEIGHT MSV2_HEAD_PARSER_SOURCE MSV2_HEAD_PARSER_WEIGHT MSV2_ROI_BACKEND_DIR; do
     if [[ -v "$variable" ]]; then supplied_values["$variable"]="${!variable}"; fi
   done
   source "$MSV2_ROOT/runtime.env"

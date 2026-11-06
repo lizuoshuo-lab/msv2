@@ -69,7 +69,9 @@ def source_fingerprint(source):
 def implementation_fingerprint(package=None):
     digest = hashlib.sha256()
     for path in sorted(
-        (Path(package) if package else Path(__file__).parent).glob("*.py")
+        p
+        for p in (Path(package) if package else Path(__file__).parent).iterdir()
+        if p.is_file() and p.suffix in (".py", ".patch")
     ):
         digest.update(path.name.encode())
         digest.update(path.read_bytes())

@@ -10,7 +10,6 @@ import argparse
 import ast
 import copy
 import importlib.util
-import hashlib
 import json
 import math
 import os
@@ -196,7 +195,9 @@ class Engine:
             if self.sr_region == "face"
             else None,
             sr_region=self.sr_region,
-            view_layout="full4x_mask_composite" if self.sr_region == "face" else "full",
+            view_layout="parent1x_mask_child4x_joint"
+            if self.sr_region == "face"
+            else "full",
             additional_training_views=False,
             full_frame_4x_generated=False,
             crop_used=False,
@@ -214,6 +215,8 @@ class Engine:
         print("SOURCE_SNAPSHOT_READY", len(rows), flush=True)
 
     def stage_pixels(self, scale):
+        if scale == 4 and self.sr_region == "face":
+            return self.paired_pixels()
         run = self.root / NAMES[scale]
         out = run / "dataset/images"
         out.mkdir(parents=True, exist_ok=True)
@@ -274,22 +277,74 @@ class Engine:
         )
         print("PIXELS_READY", scale, len(rows), flush=True)
 
+    def paired_pixels(self):
+        from .paired import verify_inputs
+
+        run = self.root / NAMES[4]
+        sr = read(run / "superresolution.json")
+        assert sr["state"] == "completed"
+        records = {item["name"]: item for item in sr["records"]}
+        rows = self.native_rows()
+        assert len(records) == len(rows) and set(records) == {r["image"] for r in rows}
+        assert {p.name for p in (run / "dataset/images").iterdir()} == set(records)
+        items = []
+        for row in rows:
+            item = records[row["image"]]
+            assert item["native_sha256"] == row["sha256"]
+            verify_inputs(run, item, row["wh"])
+            self._verify_face_masks(run, item, row["wh"])
+            items.append(
+                dict(
+                    name=row["image"],
+                    native_sha256=row["sha256"],
+                    image_sha256=item["output_sha256"],
+                )
+            )
+        save(
+            run / "pixels.json",
+            dict(
+                scale=4,
+                count=len(rows),
+                source_frames=len(rows),
+                view_count=len(rows),
+                items=items,
+                full_rgb=True,
+                no_mask=not any(r["children"] for r in records.values()),
+                **self._image_route(4),
+            ),
+        )
+        print(
+            "PAIRED_PIXELS_READY",
+            len(rows),
+            sum(len(r["children"]) for r in records.values()),
+            flush=True,
+        )
+
     def _image_route(self, scale):
-        face = scale == 4 and self.sr_region == "face"
-        path = self.root / NAMES[4] / "superresolution.json"
-        sr = read(path) if scale == 4 and path.exists() else {}
-        used = face and any(item.get("face_count", 0) for item in sr.get("records", []))
+        if scale == 4 and self.sr_region == "face":
+            from .paired import route
+
+            p = self.root / NAMES[4] / "superresolution.json"
+            sr = read(p) if p.exists() else {}
+            records = {r["name"]: r for r in sr.get("records", [])}
+            result = route(any(r.get("children") for r in records.values()))
+            result["training_mask_used"] = any(
+                records.get(row["image"], {}).get("children")
+                for i, row in enumerate(self.native_rows())
+                if i % self.config["holdout"] != 0
+            )
+            return result
         return dict(
             sr_region=self.sr_region if scale == 4 else None,
-            mask_scope="face" if face else None,
-            mask_source="existing_digital_human_face_parsing" if face else None,
+            mask_scope=None,
+            mask_source=None,
             training_mask_used=False,
-            input_composite_mask=used,
-            input_face_mask_used=used,
-            preprocessing_crop_used=used,
-            view_layout="full4x_mask_composite" if face else f"full{scale}x",
+            input_composite_mask=False,
+            input_face_mask_used=False,
+            preprocessing_crop_used=False,
+            view_layout=f"full{scale}x",
             additional_training_views=False,
-            full_frame_4x_generated=scale == 4 and sr.get("state") == "completed",
+            full_frame_4x_generated=scale == 4,
             one_complete_training_image_per_source=True,
         )
 
@@ -382,7 +437,7 @@ class Engine:
                 input_face_mask_used=False,
                 additional_training_views=False,
                 full_frame_4x_generated=False,
-                view_layout="full4x_mask_composite"
+                view_layout="parent1x_mask_child4x_joint"
                 if extractor is not None
                 else "full4x",
             )
@@ -450,6 +505,9 @@ class Engine:
                     assert done[row["image"]]["native_sha256"] == row["sha256"]
                     assert sha(dst) == done[row["image"]]["output_sha256"]
                     if extractor is not None:
+                        from .paired import verify_inputs
+
+                        verify_inputs(run, done[row["image"]], row["wh"])
                         self._verify_face_masks(run, done[row["image"]], row["wh"])
                     continue
                 started = time.monotonic()
@@ -460,7 +518,8 @@ class Engine:
                     arr, call = infer(rgb)
                     calls.append(call)
                 else:
-                    from .mask_sr import compose_face
+                    from .paired_data import compose_parent_child
+                    from .paired import save_inputs
 
                     regions, extraction = extractor.regions(rgb)
 
@@ -469,49 +528,41 @@ class Engine:
                         calls.append(call)
                         return result
 
-                    arr, composition = compose_face(
-                        rgb, regions, callback, context_native=32, feather_native=2
+                    children, composition = compose_parent_child(
+                        rgb,
+                        regions,
+                        callback,
+                        context_native=32,
+                        roi_context_native=8,
+                        feather_native=2,
                     )
-                    assert (
-                        composition["full_frame_4x_generated"]
-                        and composition["outside_mask_equal_reference"]
+                    item = save_inputs(
+                        run,
+                        dict(row, native_image=str(src)),
+                        rgb,
+                        regions,
+                        children,
+                        composition,
+                        extraction,
+                        calls,
                     )
-                    assert (
-                        composition["one_complete_training_image"]
-                        and composition["added_views"] == 0
+                    item["seconds"] = time.monotonic() - started
+                    state["records"].append(item)
+                    state.update(
+                        updated=now(),
+                        processed=len(state["records"]),
+                        state="running",
+                        peak_reserved_gib=torch.cuda.max_memory_reserved() / 1024**3,
                     )
-                    assert (
-                        composition["source_rgb_sha256"]
-                        == hashlib.sha256(rgb.tobytes()).hexdigest()
+                    save(p, state)
+                    print(
+                        "SWINIR_PAIRED",
+                        len(state["records"]),
+                        json.dumps(item),
+                        flush=True,
                     )
-                    assert (
-                        composition["output_rgb_sha256"]
-                        == hashlib.sha256(arr.tobytes()).hexdigest()
-                    )
-                    for number, region in enumerate(regions, 1):
-                        mask = np.asarray(region["mask_native"])
-                        assert mask.dtype == np.bool_ and mask.shape == rgb.shape[:2]
-                        if not mask.any():
-                            continue
-                        mask_name = f"{src.stem}_face_{number:03d}.png"
-                        mask_path = run / "face-masks" / mask_name
-                        mask_path.parent.mkdir(parents=True, exist_ok=True)
-                        temporary = mask_path.with_name(mask_path.name + ".tmp")
-                        Image.fromarray(mask.astype(np.uint8) * 255).save(
-                            temporary, format="PNG"
-                        )
-                        temporary.replace(mask_path)
-                        faces.append(
-                            dict(
-                                bbox_native=region["bbox_native"],
-                                mask_name=mask_name,
-                                mask_sha256=sha(mask_path),
-                                mask_pixels=int(mask.sum()),
-                                native_mask_array_sha256=hashlib.sha256(
-                                    mask.tobytes()
-                                ).hexdigest(),
-                            )
-                        )
+                    del children, rgb
+                    continue
                 assert arr.dtype == np.uint8 and arr.shape == (
                     rgb.shape[0] * 4,
                     rgb.shape[1] * 4,
@@ -554,7 +605,7 @@ class Engine:
             finished=now(),
             source_frames=len(state["records"]),
             view_count=len(state["records"]),
-            full_frame_4x_generated=True,
+            full_frame_4x_generated=extractor is None,
             additional_training_views=False,
         )
         if extractor is not None:
@@ -565,6 +616,10 @@ class Engine:
                 face_region_count=sum(r["face_count"] for r in state["records"]),
                 input_composite_mask=used,
                 input_face_mask_used=used,
+                training_mask_used=self._image_route(4)["training_mask_used"],
+                parent_scale=1,
+                child_scale=4,
+                joint_source_update=True,
             )
         save(p, state)
         self.stage_pixels(4)
@@ -576,6 +631,8 @@ class Engine:
         import struct
 
         run = self.root / NAMES[scale]
+        paired = scale == 4 and self.sr_region == "face"
+        camera_scale = 1 if paired else scale
         data = run / "dataset"
         sp = data / "sparse/0"
         sp.mkdir(parents=True, exist_ok=True)
@@ -595,20 +652,24 @@ class Engine:
                         [c.params[0], c.params[0], c.params[1], c.params[2]]
                     )
                 )
-                f.write(struct.pack("<iiQQ", cid, 1, c.width * scale, c.height * scale))
-                f.write(struct.pack("<4d", *(params * scale)))
+                f.write(
+                    struct.pack(
+                        "<iiQQ", cid, 1, c.width * camera_scale, c.height * camera_scale
+                    )
+                )
+                f.write(struct.pack("<4d", *(params * camera_scale)))
         loaded = read_intrinsics_binary(str(sp / "cameras.bin"))
         for cid, c in cameras.items():
             assert (
-                loaded[cid].width == c.width * scale
-                and loaded[cid].height == c.height * scale
+                loaded[cid].width == c.width * camera_scale
+                and loaded[cid].height == c.height * camera_scale
             )
             params = (
                 np.asarray(c.params)
                 if c.model == "PINHOLE"
                 else np.asarray([c.params[0], c.params[0], c.params[1], c.params[2]])
             )
-            assert np.array_equal(loaded[cid].params, params * scale)
+            assert np.array_equal(loaded[cid].params, params * camera_scale)
         assert sha(sp / "images.bin") == sha(self.prep / "dataset/sparse/0/images.bin")
         assert sha(sp / "points3D.bin") == sha(
             self.prep / "dataset/sparse/0/points3D.bin"
@@ -619,23 +680,34 @@ class Engine:
         for i, r in enumerate(rows):
             r["native_image"] = str(self.prep / "dataset/images" / r["name"])
             r["image"] = str(data / "images" / r["name"])
-            r["wh"] = [int(v * scale) for v in r["wh"]]
+            r["wh"] = [int(v * camera_scale) for v in r["wh"]]
             r["native_sha256"] = r["source_sha256"]
             r["source_sha256"] = pixel[r["name"]]["image_sha256"]
-            r["K"] = (np.diag([scale, scale, 1.0]) @ np.asarray(r["K"])).tolist()
+            r["K"] = (
+                np.diag([camera_scale, camera_scale, 1.0]) @ np.asarray(r["K"])
+            ).tolist()
             r["split"] = "test" if i % self.config["holdout"] == 0 else "train"
             k = np.asarray(r["K"]).copy()
             k[:2, 2] -= 0.5
             r["K_integer_centers"] = k.tolist()
+        if paired:
+            from .paired import camera_children
+
+            records = {
+                item["name"]: item
+                for item in read(run / "superresolution.json")["records"]
+            }
+            for row in rows:
+                camera_children(row, records[row["name"]], run)
         save(
             run / "training-inputs.json",
             dict(
                 records=rows,
-                mask_used=False,
+                mask_used=self._image_route(scale)["training_mask_used"],
                 **self._image_route(scale),
                 source_frames=len(rows),
                 view_count=len(rows),
-                crop_used=False,
+                crop_used=self._image_route(scale)["preprocessing_crop_used"],
                 background_trained=True,
                 scale=scale,
                 initial_sparse_sha256=sha(sp / "points3D.bin"),
@@ -666,9 +738,17 @@ class Engine:
             plan = read(plan_path)
             plan.update(
                 **self._image_route(scale),
+                mask_used=self._image_route(scale)["training_mask_used"],
                 source_frames=len(rows),
                 view_count=len(rows),
-                crop_used=False,
+                crop_used=self._image_route(scale)["preprocessing_crop_used"],
+                training_algorithm_changes=[
+                    "joint mother-child render domains",
+                    "masked pooled L1/SSIM",
+                    "union visibility and native-unit child stats",
+                ]
+                if paired
+                else [],
             )
             save(plan_path, plan)
 
@@ -808,11 +888,22 @@ class Engine:
         c = LazyCamera(rows[len(rows) // 2], 0, backward_level)
         torch.cuda.reset_peak_memory_stats()
         start = time.monotonic()
-        output = render_imp(c, g, pipe, torch.zeros(3, device="cuda"))
+        joint = None
+        if scale == 4 and self.sr_region == "face":
+            from .paired import JointSupervision
+
+            joint = JointSupervision(render_imp, self.repo, run)
+        render_step = joint.render if joint is not None else render_imp
+        output = render_step(c, g, pipe, torch.zeros(3, device="cuda"))
         target = c.original_image.cuda()
         image = output["render"]
         l1 = (image - target).abs().mean()
         loss = 0.8 * l1 + 0.2 * (1 - fused_ssim(image[None], target[None]))
+        if joint is not None:
+            result = joint.loss(
+                c, output, target, 0.2, lambda a, b: (a - b).abs().mean(), fused_ssim
+            )
+            l1, loss = result["l1"], result["loss"]
         loss.backward()
         torch.cuda.synchronize()
         assert torch.isfinite(loss) and torch.isfinite(g._xyz.grad).all()
@@ -829,7 +920,10 @@ class Engine:
             backward_wh=[c.width, c.height],
             full_target_wh=rows[0]["wh"],
             peak_reserved_gib=peak,
-            model_and_loss_unmodified=True,
+            model_unmodified=True,
+            model_and_loss_unmodified=joint is None,
+            joint_supervision=joint.last_stats if joint is not None else None,
+            optimizer_updates=0,
             training_completed=False,
         )
         save(run / "preflight.json", result)
@@ -852,6 +946,13 @@ class Engine:
         from .memory import wrap_training_render
 
         m.render_imp = wrap_training_render(m.render_imp, self.repo)
+        joint = None
+        if scale == 4 and self.sr_region == "face":
+            from .paired import JointSupervision, install_joint_training
+
+            joint = JointSupervision(m.render_imp, self.repo, run)
+            joint_receipt = install_joint_training(m, joint, run / "joint-training.py")
+            save(run / "joint-training-receipt.json", joint_receipt)
         args, data, opt, pipe = self.options(scale)
         assert (
             args.imp_metric == self.config["importance_metric"]
@@ -878,9 +979,13 @@ class Engine:
             / 1024**3,
             target_layout="contiguous CHW, unchanged float32 pixel values",
             allocator_cache_trim="after each full-resolution backward"
-            if scale == 4
+            if scale == 4 and joint is None
             else "native",
             native_sources_unchanged=True,
+            training_loss_and_render_domains="paired masked mother1-child4"
+            if joint is not None
+            else "native",
+            joint_training=joint_receipt if joint is not None else None,
             image_buffer_offload=m.render_imp.memory_stats,
             adapter_sha256=sha(run / "training-adapter.py"),
         )
@@ -892,7 +997,7 @@ class Engine:
         def report(tb, iteration, l1, loss, *rest):
             native_report(tb, iteration, l1, loss, *rest)
             c = LazyCamera.last
-            if scale == 4 and c is not None and c.level == 1:
+            if scale == 4 and joint is None and c is not None and c.level == 1:
                 torch.cuda.empty_cache()
             if iteration % 100 == 0 or iteration in (
                 1,
@@ -918,6 +1023,9 @@ class Engine:
                     warmup_level=c.level,
                     peak_reserved_gib=torch.cuda.max_memory_reserved() / 1024**3,
                 )
+                if joint is not None:
+                    item["joint_supervision"] = joint.last_stats
+                    item["joint_source_updates"] = joint.source_updates
                 item["open_file_descriptors"] = len(os.listdir("/proc/self/fd"))
                 item["peak_allocated_gib"] = torch.cuda.max_memory_allocated() / 1024**3
                 item["allocated_gib"] = torch.cuda.memory_allocated() / 1024**3
@@ -929,7 +1037,8 @@ class Engine:
 
         m.training_report = report
         try:
-            # Identical native training function, loss, optimizer, render and depth kernels.
+            # Paired face mode adapts only render/loss call sites; native Gaussian
+            # model, optimizer, source sampling and refinement schedule are retained.
             m.training(data, opt, pipe, [-1], [self.iterations], [], None, -1, args)
             torch.cuda.synchronize()
             scene = Scene.latest
@@ -990,7 +1099,13 @@ class Engine:
             save(run / "execution.json", state)
             print("STANDARD_TRAINING_COMPLETED", json.dumps(state), flush=True)
         except BaseException as e:
-            state.update(state="failed", finished=now(), error=repr(e))
+            state.update(
+                state="interrupted"
+                if isinstance(e, (KeyboardInterrupt, SystemExit))
+                else "failed",
+                finished=now(),
+                error=repr(e),
+            )
             save(run / "execution.json", state)
             raise
 

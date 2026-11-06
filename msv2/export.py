@@ -2,7 +2,10 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-import copy, json, shutil, zipfile
+import copy
+import json
+import shutil
+import zipfile
 import numpy as np
 from .engine import NAMES, LazyCamera
 from .io import read_json as read, save_json as save, sha256 as sha
@@ -69,12 +72,34 @@ def camera_records(rows):
 
 
 def camera_input_mapping(rows, sr_region=None, *, sr=None):
-    """Record complete training views; a mask never creates another camera."""
-    from .report import view_summary
+    """Keep standard source cameras distinct from optional auxiliary ROIs."""
+    from .report import PAIRED_LAYOUT, paired_view_summary, view_summary
 
     counts = view_summary(rows)
     dimensions = counts["view_dimensions"]
     face_mode = sr_region == "face"
+    if face_mode and sr is not None and sr.get("view_layout") == PAIRED_LAYOUT:
+        paired = paired_view_summary(rows, sr)
+        return dict(
+            records=[
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in ("image", "native_image")
+                }
+                for row in rows
+            ],
+            **paired,
+            mask_used=paired["training_mask_used"],
+            full_frame=True,
+            crop_views_present=False,
+            coordinate_convention="COLMAP .5-based pixel centers",
+            training_resolution=dimensions[0] if len(dimensions) == 1 else None,
+            training_resolutions=dimensions,
+            mother_cameras=len(rows),
+            auxiliary_child_cameras=paired["auxiliary_children"],
+            standard_cameras_contain="native1 mothers only",
+        )
     if face_mode:
         if (
             sr is None
@@ -126,6 +151,126 @@ def camera_input_mapping(rows, sr_region=None, *, sr=None):
         mask_scope="face" if face_mode else None,
         outside_mask_reference="Original full-image Lanczos4" if face_mode else None,
     )
+
+
+def paired_camera_records(rows, *, transform=None):
+    """Export source-group camera metadata; child cameras are auxiliary only.
+
+    The standard cameras.json/COLMAP stay mother-only. Target PNGs are not
+    added to scene.zip: paths in this receipt refer to the frozen training run.
+    """
+    from .paired_data import child_camera
+    from .report import PAIRED_LAYOUT, view_summary
+
+    view_summary(rows)
+    matrix = np.eye(4) if transform is None else np.asarray(transform, dtype=np.float64)
+    if (
+        matrix.shape != (4, 4)
+        or not np.isfinite(matrix).all()
+        or not np.allclose(matrix[3], [0, 0, 0, 1], rtol=0, atol=1e-12)
+    ):
+        raise ValueError("Expected a finite export world transform")
+    inverse = np.linalg.inv(matrix)
+    records = []
+    total = 0
+    for row in rows:
+        pose = (np.asarray(row["w2c"]) @ inverse).tolist()
+        children = []
+        for number, saved in enumerate(row.get("children", []), 1):
+            native = child_camera(row["K"], row["w2c"], row["wh"], saved["roi_native"])
+            frozen = saved["camera"]
+            if (
+                any(
+                    not np.allclose(frozen[key], native[key], rtol=0, atol=1e-9)
+                    for key in ("K", "w2c", "full_K")
+                )
+                or frozen["wh"] != native["wh"]
+                or frozen["viewport"] != native["viewport"]
+                or saved["wh"] != native["wh"]
+            ):
+                raise ValueError(
+                    "Auxiliary camera differs from source pose/ROI calibration"
+                )
+            camera = child_camera(row["K"], pose, row["wh"], saved["roi_native"])
+            children.append(
+                dict(
+                    child_id=number,
+                    source_frame=row.get("source_frame", row["frame"]),
+                    source_name=row["name"],
+                    split=row["split"],
+                    image=saved["image"],
+                    image_sha256=saved["image_sha256"],
+                    mask=saved["mask"],
+                    mask_sha256=saved["mask_sha256"],
+                    mask_pixels=saved["mask_pixels"],
+                    camera=camera,
+                    ordinary_sampling_view=False,
+                    loss_mask_required=True,
+                    same_update_as_parent=True,
+                )
+            )
+        total += len(children)
+        records.append(
+            dict(
+                source_frame=row.get("source_frame", row["frame"]),
+                source_name=row["name"],
+                split=row["split"],
+                source_png_sha256=row["native_sha256"],
+                parent=dict(wh=row["wh"], K=row["K"], w2c=pose, scale=1),
+                children=children,
+            )
+        )
+    return dict(
+        schema="msv2-paired-parent-child-cameras-v1",
+        view_layout=PAIRED_LAYOUT,
+        source_frames=len(rows),
+        mother_cameras=len(rows),
+        auxiliary_child_cameras=total,
+        random_sampling_views=len(rows),
+        source_group_split=True,
+        children_registered_to_colmap=False,
+        child_cameras_are_auxiliary=True,
+        target_paths_relative_to_training_run=True,
+        targets_in_scene_zip=False,
+        world_transform=matrix.tolist(),
+        records=records,
+        quality_accepted=False,
+    )
+
+
+def write_scene_bundle(out, parent_count, *, paired=False):
+    """Bundle standard mother cameras plus an optional auxiliary receipt."""
+    out = Path(out)
+    bundle = out / "scene.zip"
+    with zipfile.ZipFile(
+        bundle, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=3
+    ) as z:
+        z.write(out / "point_cloud.ply", "point_cloud.ply")
+        z.write(out / "cameras.json", "cameras.json")
+        for path in sorted((out / "colmap").iterdir()):
+            z.write(path, "colmap/" + path.name)
+        for name in (
+            "upright-parity.json",
+            "native-ply-parity.json",
+            "camera-input-mapping.json",
+            "plan.json",
+        ):
+            z.write(out / name, name)
+        if paired:
+            z.write(out / "paired-cameras.json", "paired-cameras.json")
+    with zipfile.ZipFile(bundle) as z:
+        assert (
+            z.testzip() is None
+            and len(json.loads(z.read("cameras.json"))) == parent_count
+        )
+        if paired:
+            auxiliary = json.loads(z.read("paired-cameras.json"))
+            assert (
+                auxiliary["mother_cameras"]
+                == auxiliary["random_sampling_views"]
+                == parent_count
+            )
+    return bundle
 
 
 def export(engine, scale):
@@ -289,38 +434,28 @@ def export(engine, scale):
             render_checks=checks,
         ),
     )
+    mapping = camera_input_mapping(
+        rows,
+        engine.config.get("sr_region", "full") if scale == 4 else None,
+        sr=read(run / "superresolution.json")
+        if scale == 4 and engine.config.get("sr_region", "full") == "face"
+        else None,
+    )
+    paired = mapping["view_layout"] == "parent1x_mask_child4x_joint"
+    if paired:
+        save(out / "paired-cameras_world.json", paired_camera_records(rows))
+        save(
+            out / "paired-cameras.json",
+            paired_camera_records(rows, transform=transform),
+        )
     save(
         out / "camera-input-mapping.json",
-        camera_input_mapping(
-            rows,
-            engine.config.get("sr_region", "full") if scale == 4 else None,
-            sr=read(run / "superresolution.json")
-            if scale == 4 and engine.config.get("sr_region", "full") == "face"
-            else None,
-        ),
+        mapping,
     )
     shutil.copy2(run / "ply-parity.json", out / "native-ply-parity.json")
     shutil.copy2(engine.root / "plan.json", out / "plan.json")
     write_colmap_cameras(out / "colmap", rrows)
-    bundle = out / "scene.zip"
-    with zipfile.ZipFile(
-        bundle, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=3
-    ) as z:
-        z.write(yup, "point_cloud.ply")
-        z.write(out / "cameras.json", "cameras.json")
-        for path in sorted((out / "colmap").iterdir()):
-            z.write(path, "colmap/" + path.name)
-        for name in (
-            "upright-parity.json",
-            "native-ply-parity.json",
-            "camera-input-mapping.json",
-            "plan.json",
-        ):
-            z.write(out / name, name)
-    with zipfile.ZipFile(bundle) as z:
-        assert z.testzip() is None and len(json.loads(z.read("cameras.json"))) == len(
-            rows
-        )
+    bundle = write_scene_bundle(out, len(rows), paired=paired)
     save(
         out / "delivery.json",
         dict(
@@ -330,6 +465,18 @@ def export(engine, scale):
             sha256=sha(bundle),
             parity_passed=True,
             quality_accepted=False,
+            **(
+                dict(
+                    view_layout=mapping["view_layout"],
+                    mother_cameras=len(rows),
+                    auxiliary_child_cameras=mapping["auxiliary_child_cameras"],
+                    paired_cameras="paired-cameras.json",
+                    paired_cameras_sha256=sha(out / "paired-cameras.json"),
+                    children_are_standard_capture_views=False,
+                )
+                if paired
+                else {}
+            ),
         ),
     )
     print("STANDARD_EXPORT_DONE", scale, len(v), len(rows), bundle, flush=True)

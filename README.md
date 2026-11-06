@@ -48,18 +48,18 @@ COLMAP 目录应包含 `images/` 和 `sparse/0/`，支持文本或二进制模�
 
 预检核对各输入视图的像素与相机投影，反向检查遵循原生首阶段的半尺寸预热。预检通过不代表完整训练已完成，训练容量与效果仍需本地实际验证。
 
-`sr_region` 默认为 `full`。设置 `"sr_region": "face"` 时采用面部合成路线：
+`sr_region` 默认为 `full`。设置 `"sr_region": "face"` 时采用母图1倍＋面部子图4倍联合路线：
 
 ```bash
 bash ~/msv2/app/msv2.sh train /path/to/video.mp4 --config ~/msv2/app/configs/face.json
 ```
 
 1. 用现有二维解析器取得面部 mask，从原图读取包围盒及32像素自然上下文。
-2. 只对包围盒上下文做 SwinIR 四倍超分，按 mask 贴回同一张完整四倍图；羽化只发生在 mask 内。
-3. mask 外严格等于整幅原图的 Lanczos 四倍插值，不经过超分。它用于统一像素网格，保留原始图像内容；无面部时整张图为原图插值四倍。
-4. 每个源帧只有一张完整训练图、一套整图相机。整幅 `fx/fy/cx/cy × 4`，外参保持不变；人体、面部和背景共同拟合同一个场景。
+2. 母图保留原始尺寸和 PNG 字节，只对面部包围盒及自然上下文做 SwinIR 四倍超分。子图只保存带至少8个原生像素上下文的 ROI，向外对齐8像素网格，不生成完整四倍训练图；源图右下边界的补齐像素不参与子图损失。
+3. mask 外使用母图原始1倍监督，mask 内使用子图4倍监督；子图 mask 外不计子图损失，羽化仅向 mask 内部。两部分在同一次优化器更新中共同拟合。没有面部子图的源帧按原始母图1倍训练。
+4. 每个源帧仍是一个随机采样组，一套原始母相机；子图只作为该源帧的辅助数据，不加入 COLMAP 或独立随机采样池。子图校准为 `Kchild = S4 × T(-ROI原点) × Kparent`，外参不变；实际光栅化保留母相机的完整 FoV 和投影，并使用对应 ROI viewport，不能用普通裁剪相机替代。
 
-面部 mask 包含皮肤、五官和耳部，排除头发、帽子、颈部与衣物。独立的 `extract-head` 命令仍输出包含头发和帽子的头部像素。mask 只决定输入图哪些像素使用超分，不是训练损失 mask。原生模型、损失、优化器和训练日程保持原样。大图训练仅将光栅器的图像工作区字节临时存到 CPU，反传前完整还原。
+面部 mask 包含皮肤、五官和耳部，排除头发、帽子、颈部与衣物。独立的 `extract-head` 命令仍输出包含头发和帽子的头部像素。此路线的 mask 同时限定子图监督范围与母图监督范围，联合损失和 ROI 渲染域单独记录；高斯模型与优化器采用原生实现。预热期间母图按实际尺寸缩放，子图 ROI 与内参同步映射，保留完整 FoV。历史整幅四倍面部合成不是这条母子图路线。
 
 配置在 `~/msv2/config.json`，首次部署从 [默认配置](configs/default.json) 创建，更新时保留。可修改 `sample_fps`、`scales`、`importance_metric` 等；`frame_indices` 可指定递增、唯一的原视频帧号以精确复现某个数据集。训练预算需至少 8,001 步，保证完整走过原生简化阶段；默认是 18,000。完整选项见 [配置定义](msv2/config.py)。修改配置后下一项任务会采用新配置，已有任务保持冻结配置。
 
@@ -69,10 +69,12 @@ bash ~/msv2/app/msv2.sh train /path/to/video.mp4 --config ~/msv2/app/configs/fac
 
 - `state.json`：本轮阶段、错误和已完成倍率。
 - `logs/`：抽帧、相机、预检、训练和导出的逐阶段日志；预处理详细日志另在 `prepared/logs/`。
-- `swinir4x/superresolution.json`、`swinir4x/training-inputs.json`：面部 mask 与包围盒来源、整图合成核查、逐帧尺寸／内参及训练／留出分组。
+- `swinir4x/superresolution.json`、`swinir4x/training-inputs.json`：面部 mask 与 ROI 来源、母图字节保护、辅助子图与相机映射、逐源帧训练／留出分组。面部路线的子图及损失 mask 在 `swinir4x/children/`，不在主图像采样目录。
 - `export/comparison.html`：原图与各倍率逐帧对照，留出指标统一在原图尺寸计算。
 - `export/<倍率>/scene.zip`：标准高斯 `point_cloud.ply`、完整 `cameras.json`、COLMAP 文本相机、坐标变换与一致性核验记录。
 - `export/<倍率>/point_cloud_world.ply`、`cameras_world.json`：原训练世界坐标文件。
+
+面部母子图路线另导出 `paired-cameras.json`（包含在 `scene.zip`）与 `paired-cameras_world.json`，记录母子关系、源帧分组、子图 K／完整 K／viewport、相同外参及 mask 依据。主 `cameras.json` 和 COLMAP 文本只包含原始母相机，辅助子相机不计入原始拍摄视角数。训练子图 PNG 不打包进通用场景 ZIP。
 
 主 PLY 将 COLMAP 世界坐标绕 X 轴旋转 180°，中心、完整协方差、各阶 SH 和相机同步变换；它不代表测量得到的重力方向。文件采用标准 3DGS 字段，可独立导入支持该格式的查看器。COLMAP 文本导出提供相机轨迹，不包含原始特征观测。
 
@@ -88,7 +90,11 @@ git -C ~/msv2/app pull --ff-only && bash ~/msv2/app/deploy.sh
 
 ## 本地检查
 
+新建 CPU 测试环境可先安装 CPU 版 PyTorch；已有训练环境直接沿用原 PyTorch，不需要替换 CUDA 包。
+
 ```bash
+# 仅新建 CPU 测试环境需要执行这一行
+python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e . -r requirements-test.txt
 python -m pytest -q
 ruff check --select F,E9 msv2 tests
@@ -98,7 +104,7 @@ bash msv2.sh doctor
 
 CPU 测试覆盖真实 FFmpeg 横竖屏解码、PTS、COLMAP 文本／二进制数据关系、缩放、上传稳定性与隔离部署；`doctor` 另检查实际 CUDA 前向／反向。GPU 重建结果和 CPU 测试分别记录，不以导入或哈希检查代替完整训练。
 
-当前面部合成代码在 Linux CPU 环境下171项测试通过，覆盖 mask 外像素一致性、原图保护、无面部／多面部、单帧单图单相机和整幅内参缩放。真实 GPU 输入、完整训练与效果另行记录。
+面部母子图的 CPU 检查覆盖母图原字节保护、ROI 像素与 mask 孔洞／边界、多面部重叠归属、奇数尺寸预热映射及辅助相机导出。CPU 数据与格式检查不代表 ROI 光栅化／梯度、完整训练或重建效果通过，这些结果另行记录。
 
 此前整幅输入路线的本地验证（2026-11-05）：Linux 下 76 项测试通过；真实视频抽帧及 COLMAP 恢复完成 59／59 帧配准；新入口对真实 59 视角数据完成 8,001 步验证训练，产出 658,831 个高斯，原生 PLY 回读、坐标变换及通用导出均通过。默认生产训练仍为 18,000 步。这些历史记录不代表重建质量验收。
 

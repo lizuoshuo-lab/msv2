@@ -135,6 +135,13 @@ class DeploymentTests(unittest.TestCase):
             'printf "%s\\0" "$@" >> "$MSV2_ROOT/interpreter-calls"\ncat >/dev/null\n',
         )
         self.environment["MSV2_PYTHON"] = str(interpreter)
+        # CPU contract double: both fresh and supplied-Python deployments must
+        # discover a compiler for the isolated ROI backend. No CUDA is executed.
+        toolkit = self.folder / "test cuda toolkit"
+        self.script(
+            toolkit / "bin/nvcc", 'echo "Cuda compilation tools, release 12.8, V12.8"\n'
+        )
+        self.environment["CUDA_HOME"] = str(toolkit)
         lock = {}
         for key, directory in (
             ("mini_splatting2", "mini-splatting2"),
@@ -242,7 +249,16 @@ class DeploymentTests(unittest.TestCase):
                     (self.root / "config.json").read_text(), '{"sample_fps":1.5}\n'
                 )
         calls = (self.root / "interpreter-calls").read_bytes().split(b"\0")[:-1]
-        self.assertEqual(calls, [b"-s", b"-", b"-s", b"-"])
+        # Existing packages remain untouched; the additional setup invocation
+        # only builds/verifies the independent ROI backend from the same source.
+        one_setup = [
+            b"-s",
+            b"-",
+            b"-s",
+            b"-",
+            str(self.root / "vendor/mini-splatting2").encode(),
+        ]
+        self.assertEqual(calls, one_setup * 2)
         self.assertFalse((self.root / ".venv").exists())
         self.assertTrue((self.root / "runtime.env").is_file())
         self.assertEqual(
@@ -411,6 +427,7 @@ class DeploymentTests(unittest.TestCase):
             "mv",
             "cp",
             "chmod",
+            "grep",
         ):
             (self.command_bin / name).symlink_to(shutil.which(name))
         self.script(self.command_bin / "id", 'printf "1000\\n"\n')
@@ -420,7 +437,7 @@ class DeploymentTests(unittest.TestCase):
         )
         self.script(
             self.command_bin / "apt-get",
-            'printf "%s\\n" "$*" >> "$MSV2_ROOT/apt-calls"\nif [[ "$1" == install ]]; then\nfor tool in ffmpeg ffprobe colmap git; do\nprintf \'#!/usr/bin/env bash\\nexit 0\\n\' > "$MSV2_TEST_BIN/$tool"\nchmod +x "$MSV2_TEST_BIN/$tool"\ndone\nfi\n',
+            'printf "%s\\n" "$*" >> "$MSV2_ROOT/apt-calls"\nif [[ "$1" == install ]]; then\nfor tool in ffmpeg ffprobe colmap git g++ make; do\nprintf \'#!/usr/bin/env bash\\nexit 0\\n\' > "$MSV2_TEST_BIN/$tool"\nchmod +x "$MSV2_TEST_BIN/$tool"\ndone\nfi\n',
         )
         self.environment["PATH"] = str(self.command_bin)
         self.environment["MSV2_TEST_BIN"] = str(self.command_bin)
@@ -429,7 +446,11 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         calls = (self.root / "apt-calls").read_text().splitlines()
         self.assertEqual(
-            calls, ["update", "install --yes --no-install-recommends ffmpeg colmap git"]
+            calls,
+            [
+                "update",
+                "install --yes --no-install-recommends ffmpeg colmap git build-essential",
+            ],
         )
         second = self.invoke(bootstrap)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)

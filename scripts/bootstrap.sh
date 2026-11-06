@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
-# Pinned, isolated runtime installation. Existing interpreter mode is read-only.
+# Pinned runtime; supplied Python packages stay unchanged. ROI builds separately.
 set -euo pipefail
 APP_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export MSV2_ROOT="${MSV2_ROOT:-$HOME/msv2}"
+if [[ -f "$MSV2_ROOT/runtime.env" ]]; then
+  declare -A supplied_values=()
+  for variable in MSV2_PYTHON MSV2_SOURCE_DIR MSV2_SWINIR_SOURCE MSV2_SWINIR_WEIGHT MSV2_EXTENSIONS_DIR MSV2_HEAD_DETECTOR_WEIGHT MSV2_HEAD_PARSER_SOURCE MSV2_HEAD_PARSER_WEIGHT MSV2_ROI_BACKEND_DIR CUDA_HOME; do
+    if [[ -v "$variable" ]]; then supplied_values["$variable"]="${!variable}"; fi
+  done
+  source "$MSV2_ROOT/runtime.env"
+  for variable in "${!supplied_values[@]}"; do export "$variable=${supplied_values[$variable]}"; done
+fi
 [[ "$(uname -s)" == Linux ]] || { echo 'Use a Linux NVIDIA host or WSL2 with NVIDIA CUDA support.' >&2; exit 1; }
 host_python="${MSV2_BOOTSTRAP_PYTHON:-}"
 if [[ -z "$host_python" ]]; then
@@ -28,9 +36,9 @@ require_tools ffmpeg ffmpeg ffprobe
 require_tools colmap colmap
 require_tools git git
 require_tools util-linux flock
+require_tools build-essential g++ make
 if [[ -z "$existing_python" ]]; then
   "$host_python" -c 'import sys; assert (3,10)<=sys.version_info[:2]<(3,12), "Python 3.10 or 3.11 is required"'
-  require_tools build-essential g++ make
   if ! "$host_python" -c 'import venv,ensurepip' >/dev/null 2>&1; then
     packages+=("$("$host_python" -c 'import sys; print("python%d.%d-venv" % sys.version_info[:2])')")
   fi
@@ -65,35 +73,32 @@ if [[ ! -e "$MSV2_ROOT/config.json" ]]; then
   [[ -f "$APP_DIR/configs/default.json" ]] || { echo 'Repository configuration is missing: configs/default.json' >&2; exit 1; }
   cp -- "$APP_DIR/configs/default.json" "$MSV2_ROOT/config.json"
 fi
-if [[ -n "$existing_python" ]]; then
-  [[ -x "$existing_python" ]] || { echo "MSV2_PYTHON is not executable: $existing_python" >&2; exit 1; }
-else
-  for executable in g++ make; do
-    command -v "$executable" >/dev/null || { echo "Build tool missing: $executable. Install git and build-essential." >&2; exit 1; }
-  done
-  cuda_128() {
-    [[ -x "$1/bin/nvcc" ]] && "$1/bin/nvcc" --version 2>/dev/null | grep -Eq 'release 12\.8([ ,]|$)'
-  }
-  if [[ -z "${CUDA_HOME:-}" ]]; then
-    cuda_candidates=()
-    if command -v nvcc >/dev/null; then
-      cuda_candidates+=("$(dirname -- "$(dirname -- "$(readlink -f -- "$(command -v nvcc)")")")")
-    fi
-    cuda_candidates+=("$MSV2_ROOT/toolchains/cuda-12.8" "$HOME/.local/cuda-12.8")
-    # User-installed toolkits may not be on a noninteractive SSH session's PATH.
-    # These bounded globs cover common user data locations without sourcing env files.
-    for nvcc_candidate in "$HOME"/.local/share/cuda*/bin/nvcc "$HOME"/.local/share/*/cuda*/bin/nvcc; do
-      if [[ -x "$nvcc_candidate" ]]; then cuda_candidates+=("$(dirname -- "$(dirname -- "$nvcc_candidate")")"); fi
-    done
-    cuda_candidates+=(/usr/local/cuda-12.8 /usr/local/cuda)
-    for cuda_candidate in "${cuda_candidates[@]}"; do
-      if cuda_128 "$cuda_candidate"; then CUDA_HOME="$cuda_candidate"; break; fi
-    done
+for executable in g++ make; do
+  command -v "$executable" >/dev/null || { echo "Build tool missing: $executable. Install git and build-essential." >&2; exit 1; }
+done
+cuda_128() {
+  [[ -x "$1/bin/nvcc" ]] && "$1/bin/nvcc" --version 2>/dev/null | grep -Eq 'release 12\.8([ ,]|$)'
+}
+if [[ -z "${CUDA_HOME:-}" ]]; then
+  cuda_candidates=()
+  if command -v nvcc >/dev/null; then
+    cuda_candidates+=("$(dirname -- "$(dirname -- "$(readlink -f -- "$(command -v nvcc)")")")")
   fi
-  [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]] || { echo 'CUDA Toolkit 12.8 compiler missing. Install the NVIDIA toolkit or set CUDA_HOME; the PyTorch CUDA wheel alone does not include nvcc.' >&2; exit 1; }
-  cuda_128 "$CUDA_HOME" || { echo 'This pinned runtime requires CUDA Toolkit 12.8.' >&2; exit 1; }
-  export CUDA_HOME PATH="$CUDA_HOME/bin:$PATH"
+  cuda_candidates+=("$MSV2_ROOT/toolchains/cuda-12.8" "$HOME/.local/cuda-12.8")
+  # User-installed toolkits may not be on a noninteractive SSH session's PATH.
+  # These bounded globs cover common user data locations without sourcing env files.
+  for nvcc_candidate in "$HOME"/.local/share/cuda*/bin/nvcc "$HOME"/.local/share/*/cuda*/bin/nvcc; do
+    if [[ -x "$nvcc_candidate" ]]; then cuda_candidates+=("$(dirname -- "$(dirname -- "$nvcc_candidate")")"); fi
+  done
+  cuda_candidates+=(/usr/local/cuda-12.8 /usr/local/cuda)
+  for cuda_candidate in "${cuda_candidates[@]}"; do
+    if cuda_128 "$cuda_candidate"; then CUDA_HOME="$cuda_candidate"; break; fi
+  done
 fi
+[[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]] || { echo 'CUDA Toolkit 12.8 compiler missing. Install the NVIDIA toolkit or set CUDA_HOME; the PyTorch CUDA wheel alone does not include nvcc.' >&2; exit 1; }
+cuda_128 "$CUDA_HOME" || { echo 'This pinned runtime requires CUDA Toolkit 12.8.' >&2; exit 1; }
+export CUDA_HOME PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MSV2_SOURCE_DIR="${MSV2_SOURCE_DIR:-$MSV2_ROOT/vendor/mini-splatting2}"
 export MSV2_SWINIR_SOURCE="${MSV2_SWINIR_SOURCE:-$MSV2_ROOT/vendor/SwinIR}"
 export MSV2_SWINIR_WEIGHT="${MSV2_SWINIR_WEIGHT:-$MSV2_ROOT/weights/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth}"
@@ -221,7 +226,7 @@ print('MSV2_PINNED_SOURCES_READY',flush=True)
 PY
 if [[ -n "$existing_python" ]]; then
   export MSV2_PYTHON="$existing_python"
-  echo 'Verifying the supplied interpreter without installing or upgrading packages.'
+  echo 'Verifying supplied Python packages; building the independent ROI backend separately.'
 else
   "$host_python" -c 'import sys; assert (3,10)<=sys.version_info[:2]<(3,12), "Python 3.10 or 3.11 is required"'
   export MSV2_PYTHON="$MSV2_ROOT/.venv/bin/python"
@@ -267,9 +272,18 @@ from simple_knn._C import distCUDA2
 import diff_gaussian_rasterization,diff_gaussian_rasterization_ms,fused_ssim
 print('MSV2_RUNTIME_IMPORTS_READY',torch.__version__)
 PY
+# Build the isolated viewport renderer without changing the pinned native module.
+export MSV2_ROI_BACKEND_DIR="${MSV2_ROI_BACKEND_DIR:-$MSV2_ROOT/vendor/msv2-roi-backend}"
+PYTHONPATH="$APP_DIR${MSV2_EXTENSIONS_DIR:+:$MSV2_EXTENSIONS_DIR}" "$MSV2_PYTHON" -s - "$MSV2_SOURCE_DIR" <<'PY'
+import sys
+from msv2.roi import ensure_backend
+ensure_backend(sys.argv[1])
+print('MSV2_ROI_BACKEND_READY',flush=True)
+PY
 runtime_tmp="$MSV2_ROOT/runtime.env.tmp"
 {
   printf 'export MSV2_PYTHON=%q\n' "$MSV2_PYTHON"
+  printf 'export MSV2_ROI_BACKEND_DIR=%q\n' "$MSV2_ROI_BACKEND_DIR"
   printf 'export MSV2_SOURCE_DIR=%q\n' "$MSV2_SOURCE_DIR"
   printf 'export MSV2_SWINIR_SOURCE=%q\n' "$MSV2_SWINIR_SOURCE"
   printf 'export MSV2_SWINIR_WEIGHT=%q\n' "$MSV2_SWINIR_WEIGHT"
